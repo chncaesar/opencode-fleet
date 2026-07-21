@@ -3,9 +3,9 @@
   "mcp": {
     "fleet": {
       "type": "local",
-      "command": "node",
+      "command": "npx",
       "args": [
-        "/path/to/opencode-fleet/dist/index.js",
+        "opencode-fleet",
         "--node",
         "ubuntu=http://192.168.1.10:4096",
         "--node",

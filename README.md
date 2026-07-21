@@ -68,48 +68,18 @@ Note the URL that is printed — you will use it in the master's `opencode.json`
 npm install -g opencode-fleet
 ```
 
-Build from source (recommended for now, before npm publish):
-
-```bash
-git clone <repo-url>
-cd opencode-fleet
-npm install
-npm run build
-```
-
 ## Configuration
 
 Add to your master machine's `opencode.jsonc`:
 
-**From source (local build):**
-
 ```json
 {
   "mcp": {
     "fleet": {
       "type": "local",
-      "command": "node",
+      "command": "npx",
       "args": [
-        "/path/to/opencode-fleet/dist/index.js",
-        "--node", "ubuntu=http://192.168.1.10:4096",
-        "--node", "windows=http://192.168.1.20:4096",
-        "--password", "your-shared-password",
-        "--timeout", "600"
-      ]
-    }
-  }
-}
-```
-
-**After `npm install -g opencode-fleet`:**
-
-```json
-{
-  "mcp": {
-    "fleet": {
-      "type": "local",
-      "command": "opencode-fleet",
-      "args": [
+        "opencode-fleet",
         "--node", "ubuntu=http://192.168.1.10:4096",
         "--node", "windows=http://192.168.1.20:4096",
         "--password", "your-shared-password",
