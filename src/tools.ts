@@ -105,6 +105,13 @@ export const TOOL_DEFINITIONS = [
             "Supported values: \"low\", \"medium\", \"high\". " +
             "Only effective for models that support extended thinking / reasoning.",
         },
+        cwd: {
+          type: "string",
+          description:
+            "Working directory (absolute path on the remote machine) used when a new session " +
+            "is created automatically. Has no effect if a session already exists. " +
+            "Defaults to \"/\" if omitted.",
+        },
       },
       required: ["node", "prompt"],
     },
@@ -193,6 +200,12 @@ export const TOOL_DEFINITIONS = [
           type: "string",
           description: "Name of the target node.",
         },
+        cwd: {
+          type: "string",
+          description:
+            "Working directory for the session (absolute path on the remote machine). " +
+            "Required — the session will not appear in the desktop UI without this.",
+        },
         title: {
           type: "string",
           description: "Optional display title for the session.",
@@ -208,7 +221,7 @@ export const TOOL_DEFINITIONS = [
             "Use fleet_list_models to see options.",
         },
       },
-      required: ["node"],
+      required: ["node", "cwd"],
     },
   },
   {
@@ -315,6 +328,7 @@ export async function handleSendMessage(
   if (args["agent"]) options.agent = String(args["agent"]);
   if (args["model"]) options.model = String(args["model"]);
   if (args["reasoning_effort"]) options.reasoningEffort = String(args["reasoning_effort"]);
+  if (args["cwd"]) options.cwd = String(args["cwd"]);
 
   try {
     const result = await ctx.sessions.send(node, prompt, options);
@@ -581,6 +595,9 @@ export async function handleCreateSession(
   const nodeName = String(args["node"] ?? "");
   if (!nodeName) return err("Missing required argument: node");
 
+  const cwd = String(args["cwd"] ?? "");
+  if (!cwd) return err("Missing required argument: cwd");
+
   const node = ctx.nodes.get(nodeName);
   if (!node) {
     return err(
@@ -590,6 +607,7 @@ export async function handleCreateSession(
 
   try {
     const session = await node.createSession({
+      cwd,
       title: args["title"] ? String(args["title"]) : undefined,
       agent: args["agent"] ? String(args["agent"]) : undefined,
       model: args["model"] ? String(args["model"]) : undefined,

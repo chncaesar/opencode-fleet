@@ -27,6 +27,8 @@ export interface Session {
 
 /** Options when creating a new session. */
 export interface CreateSessionOptions {
+  /** Working directory for the session. Required for the session to appear in the desktop UI. */
+  cwd: string;
   title?: string;
   /** Agent mode, e.g. "build" or "plan". Defaults to the node's configured default. */
   agent?: string;
@@ -224,8 +226,9 @@ export class OpenCodeNode {
    * @param options  Optional title, agent mode, and model override.
    *                 model should be in "providerID/modelID" format.
    */
-  async createSession(options: CreateSessionOptions = {}): Promise<Session> {
+  async createSession(options: CreateSessionOptions): Promise<Session> {
     const body: Record<string, unknown> = {};
+    body["cwd"] = options.cwd;
     if (options.title) body["title"] = options.title;
     if (options.agent) body["agent"] = options.agent;
     if (options.model) {

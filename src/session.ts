@@ -17,6 +17,11 @@ import type { FleetConfig } from "./config.js";
 
 export interface SendOptions {
   /**
+   * Working directory for the session (absolute path on the remote machine).
+   * Used when a new session is created lazily. Defaults to "/" if not provided.
+   */
+  cwd?: string;
+  /**
    * Agent mode, e.g. "build" or "plan".
    * Only applied when creating a brand-new session; has no effect on an existing session.
    */
@@ -67,6 +72,7 @@ export class SessionManager {
 
     // Create a new session, forwarding agent/model options
     const session = await node.createSession({
+      cwd: options.cwd ?? "/",
       agent: options.agent,
       model: options.model,
     });
@@ -118,6 +124,7 @@ export class SessionManager {
       if (isNotFound(err)) {
         this.sessionIds.delete(node.name);
         const session = await node.createSession({
+          cwd: options.cwd ?? "/",
           agent: options.agent,
           model: options.model,
         });
