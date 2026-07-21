@@ -3,17 +3,12 @@
   "mcp": {
     "fleet": {
       "type": "local",
-      "command": "npx",
-      "args": [
-        "opencode-fleet",
-        "--node",
-        "ubuntu=http://192.168.1.10:4096",
-        "--node",
-        "windows=http://192.168.1.20:4096",
-        "--password",
-        "your-shared-password",
-        "--timeout",
-        "600"
+      "command": [
+        "npx", "-y", "opencode-fleet",
+        "--node", "ubuntu=http://192.168.1.10:4096",
+        "--node", "windows=http://192.168.1.20:4096",
+        "--password", "your-shared-password",
+        "--timeout", "600"
       ]
     }
   }

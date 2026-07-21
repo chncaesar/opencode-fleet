@@ -77,9 +77,8 @@ Add to your master machine's `opencode.jsonc`:
   "mcp": {
     "fleet": {
       "type": "local",
-      "command": "npx",
-      "args": [
-        "opencode-fleet",
+      "command": [
+        "npx", "-y", "opencode-fleet",
         "--node", "ubuntu=http://192.168.1.10:4096",
         "--node", "windows=http://192.168.1.20:4096",
         "--password", "your-shared-password",
