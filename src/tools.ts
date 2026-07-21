@@ -15,6 +15,13 @@
 import { OpenCodeNode } from "./node.js";
 import { SessionManager } from "./session.js";
 import type { FleetConfig } from "./config.js";
+import type {
+  Part,
+  TextPart,
+  ToolPart,
+  StepFinishPart,
+  FilePart,
+} from "./node.js";
 
 // ── Context ───────────────────────────────────────────────────────────────────
 
@@ -90,7 +97,7 @@ export const TOOL_DEFINITIONS = [
         },
         limit: {
           type: "number",
-          description: "Maximum number of messages to return (default: 10, max: 50).",
+          description: "Maximum number of messages to return (default: 50, max: 200).",
         },
       },
       required: ["node"],
@@ -211,13 +218,95 @@ export async function handleSendMessage(
 
 // fleet_get_session_messages ───────────────────────────────────────────────────
 
+/**
+ * Render a single Part into human-readable text.
+ * Returns null for parts that carry no useful display content (e.g. step-start).
+ */
+function renderPart(part: Part): string | null {
+  switch (part.type) {
+    case "text": {
+      const tp = part as TextPart;
+      return tp.text.trim() ? tp.text.trim() : null;
+    }
+
+    case "tool": {
+      const toolPart = part as ToolPart;
+      const { tool, state } = toolPart;
+      const statusTag = state.status === "completed" ? "✓" : state.status === "error" ? "✗" : "…";
+
+      // Build a human-readable command/input summary
+      let inputSummary = "";
+      if (tool === "bash" && typeof state.input?.["command"] === "string") {
+        inputSummary = state.input["command"] as string;
+      } else if (tool === "write" || tool === "edit") {
+        inputSummary = String(state.input?.["filePath"] ?? state.input?.["path"] ?? "");
+      } else if (state.input) {
+        // Generic fallback: first string value or JSON dump truncated
+        const firstVal = Object.values(state.input).find((v) => typeof v === "string");
+        inputSummary = firstVal != null
+          ? String(firstVal)
+          : JSON.stringify(state.input).slice(0, 200);
+      }
+
+      const lines: string[] = [`[tool:${tool}] ${statusTag} ${inputSummary}`.trim()];
+
+      // Append output, trimmed + capped at 2000 chars to avoid flooding context
+      if (state.status !== "pending") {
+        const raw =
+          typeof state.output === "string"
+            ? state.output
+            : state.output != null
+            ? JSON.stringify(state.output)
+            : "";
+        const output = raw.trim();
+        if (output) {
+          const capped = output.length > 2000 ? output.slice(0, 2000) + "\n…(truncated)" : output;
+          lines.push(capped);
+        }
+        if (state.error) {
+          lines.push(`Error: ${state.error}`);
+        }
+      }
+
+      return lines.join("\n");
+    }
+
+    case "step-finish": {
+      const sfp = part as StepFinishPart;
+      if (!sfp.reason) return null;
+      // Only show non-trivial finish reasons (skip "tool-calls" noise)
+      if (
+        sfp.reason === "tool-calls" ||
+        sfp.reason === "end-turn" ||
+        sfp.reason === "stop"
+      )
+        return null;
+      return `[step-finish: ${sfp.reason}]`;
+    }
+
+    case "file": {
+      const fp = part as FilePart;
+      const name = fp.filename ?? fp.url ?? "(file)";
+      return `[file: ${name}${fp.mime ? ` (${fp.mime})` : ""}]`;
+    }
+
+    case "step-start":
+      // Pure snapshot marker — no display value
+      return null;
+
+    default:
+      // Unknown future types: show raw keys so nothing is silently dropped
+      return `[${part.type}]`;
+  }
+}
+
 export async function handleGetSessionMessages(
   ctx: FleetContext,
   args: Record<string, unknown>
 ): Promise<ToolResult> {
   const nodeName = String(args["node"] ?? "");
   const limitRaw = args["limit"];
-  const limit = typeof limitRaw === "number" ? Math.min(Math.max(1, limitRaw), 50) : 10;
+  const limit = typeof limitRaw === "number" ? Math.min(Math.max(1, limitRaw), 200) : 50;
 
   if (!nodeName) return err("Missing required argument: node");
 
@@ -245,18 +334,15 @@ export async function handleGetSessionMessages(
     ];
 
     for (const mwp of messages) {
-      lines.push(`[${mwp.info.role}] id=${mwp.info.id}`);
+      const role = mwp.info.role.toUpperCase();
+      lines.push(`── [${role}] id=${mwp.info.id} ──`);
 
-      if (mwp.info.role === "assistant") {
-        const text = mwp.parts
-          .filter((p): p is { type: "text"; text: string } & Record<string, unknown> =>
-            p.type === "text" && typeof (p as { text?: unknown }).text === "string"
-          )
-          .map((p) => p.text)
-          .join("");
-        if (text) lines.push(text);
+      for (const part of mwp.parts) {
+        const rendered = renderPart(part);
+        if (rendered) lines.push(rendered);
       }
-      lines.push("");
+
+      lines.push(""); // blank line between messages
     }
 
     return ok(lines.join("\n"));

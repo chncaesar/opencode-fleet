@@ -31,8 +31,71 @@ export interface TextPart {
   text: string;
 }
 
-// Other part variants we don't fully model — only need the discriminant.
-export type Part = TextPart | { type: string; [key: string]: unknown };
+export interface StepStartPart {
+  id: string;
+  sessionID: string;
+  messageID: string;
+  type: "step-start";
+  snapshot?: string;
+}
+
+export interface StepFinishPart {
+  id: string;
+  sessionID: string;
+  messageID: string;
+  type: "step-finish";
+  reason?: string;
+  snapshot?: string;
+  cost?: number;
+  tokens?: {
+    total?: number;
+    input?: number;
+    output?: number;
+    reasoning?: number;
+    cache?: { read?: number; write?: number };
+  };
+}
+
+export interface ToolState {
+  status: "pending" | "running" | "completed" | "error";
+  /** Input passed to the tool (shape depends on tool type). */
+  input?: Record<string, unknown>;
+  /** Output returned by the tool (string or structured). */
+  output?: string | unknown;
+  /** Error message if status === "error". */
+  error?: string;
+}
+
+export interface ToolPart {
+  id: string;
+  sessionID: string;
+  messageID: string;
+  type: "tool";
+  callID: string;
+  tool: string;
+  state: ToolState;
+}
+
+export interface FilePart {
+  id: string;
+  sessionID: string;
+  messageID: string;
+  type: "file";
+  mime?: string;
+  filename?: string;
+  url?: string;
+}
+
+// Catch-all for any future part types not yet modelled.
+export type UnknownPart = { type: string; [key: string]: unknown };
+
+export type Part =
+  | TextPart
+  | StepStartPart
+  | StepFinishPart
+  | ToolPart
+  | FilePart
+  | UnknownPart;
 
 export interface AssistantMessage {
   id: string;
