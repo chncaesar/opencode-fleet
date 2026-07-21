@@ -1,0 +1,24 @@
+# compiled output
+dist/
+
+# dependencies
+node_modules/
+
+# environment / secrets
+.env
+.env.*
+!.env.example
+
+# editor swap files
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# logs
+*.log
+
+# internal workflow artifacts
+docs/superpowers/

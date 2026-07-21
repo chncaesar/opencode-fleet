@@ -1,0 +1,178 @@
+# opencode-fleet
+
+An MCP server that lets a master [OpenCode](https://opencode.ai) instance coordinate multiple remote OpenCode nodes.
+
+Instead of switching between terminals, you describe what each machine should do and the master agent dispatches the work — collecting results, relaying them, and keeping the overall task on track.
+
+## Why this exists
+
+Embedded and hardware projects often span more than one machine. A typical setup:
+
+- **Ubuntu** — primary development machine. Runs the build toolchain, serial port simulator, and log analysis.
+- **Windows** — runs the HMI upper-computer application that communicates with the embedded target over a (real or simulated) serial port.
+
+Debugging across these two machines is painful. You context-switch constantly: run the simulator on Ubuntu, check the HMI on Windows, paste logs back and forth, repeat. Each machine has its own terminal, its own file system, and its own OpenCode session.
+
+`opencode-fleet` solves this by letting a single master OpenCode instance on either machine drive both. You describe the overall task once; the master dispatches subtasks to each node, collects results, and synthesises the picture — without you having to leave the chat.
+
+**Example workflow:**
+
+1. Master tells the Ubuntu node: *"Start the serial simulator in touch mode and tail the output."*
+2. Master tells the Windows node: *"Launch the HMI app and connect to the simulated port. Report what the UI shows."*
+3. Master correlates both outputs and suggests the next debugging step.
+
+## How it works
+
+```
+Master OpenCode (your machine)
+    │  uses MCP tools
+    ▼
+opencode-fleet (MCP server, this package)
+    ├─► fleet_send_message → Ubuntu node  (opencode serve at 192.168.1.10:4096)
+    └─► fleet_send_message → Windows node (opencode serve at 192.168.1.20:4096)
+```
+
+Each remote machine runs `opencode serve`. The fleet server maintains one long-lived session per node. When you send a message, it subscribes to the node's SSE event stream (`GET /event`) and resolves the moment the session goes idle — zero polling lag.
+
+## Slave setup (remote machines)
+
+On each machine that the master will control:
+
+**Linux / macOS:**
+
+```bash
+# The server must bind to 0.0.0.0 so it is reachable from other hosts.
+# Set a password if you want Basic Auth (recommended on untrusted LANs).
+OPENCODE_SERVER_PASSWORD=your-password opencode serve --hostname 0.0.0.0 --port 4096
+```
+
+**Windows (PowerShell):**
+
+```powershell
+$env:OPENCODE_SERVER_PASSWORD="your-password"
+opencode serve --hostname 0.0.0.0 --port 4096
+```
+
+**Windows (Command Prompt):**
+
+```cmd
+set OPENCODE_SERVER_PASSWORD=your-password
+opencode serve --hostname 0.0.0.0 --port 4096
+```
+
+Note the URL that is printed — you will use it in the master's `opencode.json`.
+
+## Installation
+
+```bash
+npm install -g opencode-fleet
+```
+
+Build from source (recommended for now, before npm publish):
+
+```bash
+git clone <repo-url>
+cd opencode-fleet
+npm install
+npm run build
+```
+
+## Configuration
+
+Add to your master machine's `opencode.jsonc`:
+
+**From source (local build):**
+
+```json
+{
+  "mcp": {
+    "fleet": {
+      "type": "local",
+      "command": "node",
+      "args": [
+        "/path/to/opencode-fleet/dist/index.js",
+        "--node", "ubuntu=http://192.168.1.10:4096",
+        "--node", "windows=http://192.168.1.20:4096",
+        "--password", "your-shared-password",
+        "--timeout", "600"
+      ]
+    }
+  }
+}
+```
+
+**After `npm install -g opencode-fleet`:**
+
+```json
+{
+  "mcp": {
+    "fleet": {
+      "type": "local",
+      "command": "opencode-fleet",
+      "args": [
+        "--node", "ubuntu=http://192.168.1.10:4096",
+        "--node", "windows=http://192.168.1.20:4096",
+        "--password", "your-shared-password",
+        "--timeout", "600"
+      ]
+    }
+  }
+}
+```
+
+Or set credentials via environment variables:
+
+```bash
+export FLEET_PASSWORD=your-shared-password
+```
+
+## CLI options
+
+| Option | Default | Description |
+|---|---|---|
+| `--node name=url` | (required) | Register a remote node. Repeat for multiple nodes. |
+| `--password <pw>` | `""` | Shared Basic Auth password for all nodes. |
+| `--username <u>` | `opencode` | Shared Basic Auth username for all nodes. |
+| `--timeout <s>` | `600` | Seconds to wait for an agent to finish before giving up. |
+
+Environment variable fallbacks: `FLEET_PASSWORD`, `FLEET_USERNAME`, `OPENCODE_SERVER_PASSWORD`.
+
+## MCP tools
+
+| Tool | Description |
+|---|---|
+| `fleet_list_nodes` | List all configured nodes and their health/latency. |
+| `fleet_send_message` | Send a prompt to a node and wait for the reply. |
+| `fleet_get_session_messages` | Fetch message history from a node's session. |
+| `fleet_reset_session` | Discard a node's session so the next call starts fresh. |
+| `fleet_node_health` | Check if a specific node is reachable. |
+
+## Example usage (in OpenCode chat)
+
+```
+Use fleet_list_nodes to check what machines are available.
+
+Then use fleet_send_message to the ubuntu node:
+  "Read the serial port logs at /tmp/serial.log and summarise the last 50 lines."
+
+Once it replies, use fleet_send_message to the windows node:
+  "The Ubuntu simulator reported: <summary>. Update the HMI display config accordingly."
+```
+
+## Session management
+
+The fleet server maintains one session per node in memory. Sessions are created lazily on the first message and reused across calls to preserve context. Use `fleet_reset_session` to clear a node's context when you want a clean slate.
+
+## Completion detection
+
+`fleet_send_message` subscribes to the node's SSE event stream (`GET /event`) and resolves the moment a `session.status { type: "idle" }` event arrives. This means no unnecessary waiting — the master gets the reply as soon as the remote agent finishes.
+
+If the deadline (set by `--timeout`) is reached before the session goes idle, a `TimeoutError` is raised and returned as a tool error.
+
+## Security
+
+All traffic is plain HTTP. Use a VPN or SSH tunnel when communicating over untrusted networks. Passwords are transmitted as HTTP Basic Auth — adequate for a trusted LAN, not for public internet.
+
+## License
+
+MIT

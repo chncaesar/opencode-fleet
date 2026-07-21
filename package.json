@@ -1,0 +1,41 @@
+{
+  "name": "opencode-fleet",
+  "version": "0.1.0",
+  "description": "MCP server that lets a master OpenCode instance coordinate multiple remote OpenCode nodes",
+  "keywords": [
+    "opencode",
+    "mcp",
+    "ai",
+    "multi-agent",
+    "fleet"
+  ],
+  "author": "jiachuan.zhu",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/chncaesar/opencode-fleet"
+  },
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "opencode-fleet": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "@types/node": "^22.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
