@@ -1,6 +1,6 @@
 {
   "name": "opencode-fleet",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "MCP server that lets a master OpenCode instance coordinate multiple remote OpenCode nodes",
   "keywords": [
     "opencode",
