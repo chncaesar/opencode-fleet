@@ -10,10 +10,15 @@
  *   fleet_get_session_messages — fetch message history from a node's session
  *   fleet_reset_session      — discard cached session for a node
  *   fleet_node_health        — check health of a specific node
+ *   fleet_list_sessions      — list all sessions on a node
+ *   fleet_create_session     — create a new session and bind to it
+ *   fleet_switch_session     — switch to an existing session
+ *   fleet_list_models        — list available models on a node
  */
 
 import { OpenCodeNode } from "./node.js";
 import { SessionManager } from "./session.js";
+import type { SendOptions } from "./session.js";
 import type { FleetConfig } from "./config.js";
 import type {
   Part,
@@ -78,6 +83,28 @@ export const TOOL_DEFINITIONS = [
           type: "string",
           description: "The instruction or question to send to the remote OpenCode agent.",
         },
+        agent: {
+          type: "string",
+          description:
+            "Agent mode to use when a new session is created. " +
+            "Supported values: \"build\" (default), \"plan\". " +
+            "Has no effect if a session already exists for this node.",
+        },
+        model: {
+          type: "string",
+          description:
+            "Model to use when a new session is created, in \"providerID/modelID\" format " +
+            "(e.g. \"anthropic/claude-sonnet-4-6\"). " +
+            "Use fleet_list_models to see available options. " +
+            "Has no effect if a session already exists for this node.",
+        },
+        reasoning_effort: {
+          type: "string",
+          description:
+            "Reasoning effort hint passed to each prompt call. " +
+            "Supported values: \"low\", \"medium\", \"high\". " +
+            "Only effective for models that support extended thinking / reasoning.",
+        },
       },
       required: ["node", "prompt"],
     },
@@ -131,6 +158,92 @@ export const TOOL_DEFINITIONS = [
         node: {
           type: "string",
           description: "Name of the node to check.",
+        },
+      },
+      required: ["node"],
+    },
+  },
+  {
+    name: "fleet_list_sessions",
+    description:
+      "List all sessions on a remote OpenCode node, with their titles, agents, models, " +
+      "cost, and timestamps. The currently bound session (used by fleet_send_message) " +
+      "is marked with an asterisk.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        node: {
+          type: "string",
+          description: "Name of the target node.",
+        },
+      },
+      required: ["node"],
+    },
+  },
+  {
+    name: "fleet_create_session",
+    description:
+      "Create a new session on a remote node and automatically bind to it. " +
+      "Subsequent fleet_send_message calls to this node will use the new session. " +
+      "Use this to start a fresh context, or to switch to a specific agent/model.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        node: {
+          type: "string",
+          description: "Name of the target node.",
+        },
+        title: {
+          type: "string",
+          description: "Optional display title for the session.",
+        },
+        agent: {
+          type: "string",
+          description: "Agent mode: \"build\" (default) or \"plan\".",
+        },
+        model: {
+          type: "string",
+          description:
+            "Model in \"providerID/modelID\" format, e.g. \"anthropic/claude-sonnet-4-6\". " +
+            "Use fleet_list_models to see options.",
+        },
+      },
+      required: ["node"],
+    },
+  },
+  {
+    name: "fleet_switch_session",
+    description:
+      "Switch the current binding for a node to an existing session. " +
+      "Use fleet_list_sessions to find session IDs. " +
+      "Subsequent fleet_send_message calls will continue in this session.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        node: {
+          type: "string",
+          description: "Name of the target node.",
+        },
+        session_id: {
+          type: "string",
+          description: "ID of the session to switch to (e.g. ses_07cbd9...).",
+        },
+      },
+      required: ["node", "session_id"],
+    },
+  },
+  {
+    name: "fleet_list_models",
+    description:
+      "List all available models on a remote OpenCode node. " +
+      "Returns the model IDs in \"providerID/modelID\" format that can be passed to " +
+      "fleet_send_message or fleet_create_session.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        node: {
+          type: "string",
+          description: "Name of the target node.",
         },
       },
       required: ["node"],
@@ -197,8 +310,14 @@ export async function handleSendMessage(
     );
   }
 
+  // Collect optional overrides
+  const options: SendOptions = {};
+  if (args["agent"]) options.agent = String(args["agent"]);
+  if (args["model"]) options.model = String(args["model"]);
+  if (args["reasoning_effort"]) options.reasoningEffort = String(args["reasoning_effort"]);
+
   try {
-    const result = await ctx.sessions.send(node, prompt);
+    const result = await ctx.sessions.send(node, prompt, options);
 
     const lines: string[] = [];
     lines.push(`Node: ${nodeName}`);
@@ -411,6 +530,154 @@ export async function handleNodeHealth(
   );
 }
 
+// fleet_list_sessions ──────────────────────────────────────────────────────────
+
+export async function handleListSessions(
+  ctx: FleetContext,
+  args: Record<string, unknown>
+): Promise<ToolResult> {
+  const nodeName = String(args["node"] ?? "");
+  if (!nodeName) return err("Missing required argument: node");
+
+  const node = ctx.nodes.get(nodeName);
+  if (!node) {
+    return err(
+      `Unknown node "${nodeName}". Available: ${Array.from(ctx.nodes.keys()).join(", ")}`
+    );
+  }
+
+  try {
+    const sessions = await node.listSessions();
+    if (sessions.length === 0) {
+      return ok(`Node "${nodeName}" has no sessions.`);
+    }
+
+    const boundId = ctx.sessions.getSessionId(nodeName);
+    const lines: string[] = [`Sessions on node "${nodeName}" (${sessions.length} total):\n`];
+
+    for (const s of sessions) {
+      const isBound = s.id === boundId;
+      const modelStr = s.model ? `${s.model.providerID}/${s.model.id}` : "default";
+      const agentStr = s.agent ?? "build";
+      const created = new Date(s.time.created).toISOString().slice(0, 16).replace("T", " ");
+      lines.push(
+        `${isBound ? "* " : "  "}${s.id}  [${agentStr}|${modelStr}]  "${s.title ?? "(untitled)"}"  created=${created}`
+      );
+    }
+
+    return ok(lines.join("\n"));
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return err(`Failed to list sessions on "${nodeName}": ${msg}`);
+  }
+}
+
+// fleet_create_session ─────────────────────────────────────────────────────────
+
+export async function handleCreateSession(
+  ctx: FleetContext,
+  args: Record<string, unknown>
+): Promise<ToolResult> {
+  const nodeName = String(args["node"] ?? "");
+  if (!nodeName) return err("Missing required argument: node");
+
+  const node = ctx.nodes.get(nodeName);
+  if (!node) {
+    return err(
+      `Unknown node "${nodeName}". Available: ${Array.from(ctx.nodes.keys()).join(", ")}`
+    );
+  }
+
+  try {
+    const session = await node.createSession({
+      title: args["title"] ? String(args["title"]) : undefined,
+      agent: args["agent"] ? String(args["agent"]) : undefined,
+      model: args["model"] ? String(args["model"]) : undefined,
+    });
+
+    // Bind the new session
+    ctx.sessions.setSessionId(nodeName, session.id);
+
+    const modelStr = session.model
+      ? `${session.model.providerID}/${session.model.id}`
+      : "default";
+    const agentStr = session.agent ?? "build";
+
+    return ok(
+      `Created and bound new session on "${nodeName}":\n` +
+        `  ID:    ${session.id}\n` +
+        `  Title: ${session.title ?? "(untitled)"}\n` +
+        `  Agent: ${agentStr}\n` +
+        `  Model: ${modelStr}`
+    );
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return err(`Failed to create session on "${nodeName}": ${msg}`);
+  }
+}
+
+// fleet_switch_session ─────────────────────────────────────────────────────────
+
+export async function handleSwitchSession(
+  ctx: FleetContext,
+  args: Record<string, unknown>
+): Promise<ToolResult> {
+  const nodeName = String(args["node"] ?? "");
+  const sessionId = String(args["session_id"] ?? "");
+
+  if (!nodeName) return err("Missing required argument: node");
+  if (!sessionId) return err("Missing required argument: session_id");
+
+  if (!ctx.nodes.has(nodeName)) {
+    return err(
+      `Unknown node "${nodeName}". Available: ${Array.from(ctx.nodes.keys()).join(", ")}`
+    );
+  }
+
+  const oldId = ctx.sessions.getSessionId(nodeName);
+  ctx.sessions.setSessionId(nodeName, sessionId);
+
+  return ok(
+    `Switched node "${nodeName}" to session ${sessionId}` +
+      (oldId && oldId !== sessionId ? ` (was: ${oldId})` : "")
+  );
+}
+
+// fleet_list_models ────────────────────────────────────────────────────────────
+
+export async function handleListModels(
+  ctx: FleetContext,
+  args: Record<string, unknown>
+): Promise<ToolResult> {
+  const nodeName = String(args["node"] ?? "");
+  if (!nodeName) return err("Missing required argument: node");
+
+  const node = ctx.nodes.get(nodeName);
+  if (!node) {
+    return err(
+      `Unknown node "${nodeName}". Available: ${Array.from(ctx.nodes.keys()).join(", ")}`
+    );
+  }
+
+  try {
+    const models = await node.listModels();
+    if (models.length === 0) {
+      return ok(`Node "${nodeName}" returned no models.`);
+    }
+
+    const lines: string[] = [`Models available on "${nodeName}" (${models.length} total):\n`];
+    for (const m of models) {
+      const statusMark = m.enabled === false ? " [disabled]" : "";
+      lines.push(`  ${m.providerID}/${m.id}  —  ${m.name}${statusMark}`);
+    }
+
+    return ok(lines.join("\n"));
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return err(`Failed to list models on "${nodeName}": ${msg}`);
+  }
+}
+
 // ── Dispatcher ────────────────────────────────────────────────────────────────
 
 export async function dispatchTool(
@@ -429,6 +696,14 @@ export async function dispatchTool(
       return handleResetSession(ctx, args);
     case "fleet_node_health":
       return handleNodeHealth(ctx, args);
+    case "fleet_list_sessions":
+      return handleListSessions(ctx, args);
+    case "fleet_create_session":
+      return handleCreateSession(ctx, args);
+    case "fleet_switch_session":
+      return handleSwitchSession(ctx, args);
+    case "fleet_list_models":
+      return handleListModels(ctx, args);
     default:
       return err(`Unknown tool: ${toolName}`);
   }

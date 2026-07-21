@@ -20,7 +20,30 @@ export interface Session {
   version: string;
   projectID: string;
   directory: string;
+  agent?: string;
+  model?: { id: string; providerID: string; variant?: string };
   time: { created: number; updated: number };
+}
+
+/** Options when creating a new session. */
+export interface CreateSessionOptions {
+  title?: string;
+  /** Agent mode, e.g. "build" or "plan". Defaults to the node's configured default. */
+  agent?: string;
+  /**
+   * Model to use, as "providerID/modelID", e.g. "anthropic/claude-sonnet-4-6".
+   * If omitted, the node's configured default model is used.
+   */
+  model?: string;
+}
+
+/** A model entry returned by GET /api/model. */
+export interface ModelInfo {
+  id: string;
+  providerID: string;
+  name: string;
+  enabled?: boolean;
+  status?: string;
 }
 
 export interface TextPart {
@@ -195,9 +218,33 @@ export class OpenCodeNode {
     return Array.isArray(result) ? result : result.sessions ?? [];
   }
 
-  /** Create a new session. Returns the created session. */
-  async createSession(): Promise<Session> {
-    return this.request<Session>("POST", "/session", {});
+  /**
+   * Create a new session.
+   *
+   * @param options  Optional title, agent mode, and model override.
+   *                 model should be in "providerID/modelID" format.
+   */
+  async createSession(options: CreateSessionOptions = {}): Promise<Session> {
+    const body: Record<string, unknown> = {};
+    if (options.title) body["title"] = options.title;
+    if (options.agent) body["agent"] = options.agent;
+    if (options.model) {
+      const [providerID, ...rest] = options.model.split("/");
+      const id = rest.join("/");
+      if (providerID && id) {
+        body["model"] = { id, providerID };
+      }
+    }
+    return this.request<Session>("POST", "/session", body);
+  }
+
+  /** List all available models on the node. */
+  async listModels(): Promise<ModelInfo[]> {
+    const result = await this.request<{ data?: ModelInfo[]; location?: unknown }>(
+      "GET",
+      "/api/model"
+    );
+    return result.data ?? [];
   }
 
   /** Delete / close a session. */
@@ -210,11 +257,21 @@ export class OpenCodeNode {
   /**
    * Send a prompt to a session asynchronously (non-blocking).
    * The agent begins processing; use pollStatus() to wait for completion.
+   *
+   * @param sessionId         Target session ID.
+   * @param prompt            The prompt text.
+   * @param reasoningEffort   Optional reasoning effort hint ("low" | "medium" | "high").
    */
-  async sendPromptAsync(sessionId: string, prompt: string): Promise<void> {
-    await this.request<unknown>("POST", `/session/${sessionId}/prompt_async`, {
+  async sendPromptAsync(
+    sessionId: string,
+    prompt: string,
+    reasoningEffort?: string
+  ): Promise<void> {
+    const body: Record<string, unknown> = {
       parts: [{ type: "text", text: prompt }],
-    });
+    };
+    if (reasoningEffort) body["reasoning_effort"] = reasoningEffort;
+    await this.request<unknown>("POST", `/session/${sessionId}/prompt_async`, body);
   }
 
   /**

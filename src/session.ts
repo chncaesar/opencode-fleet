@@ -15,6 +15,23 @@
 import { OpenCodeNode, type MessageWithParts } from "./node.js";
 import type { FleetConfig } from "./config.js";
 
+export interface SendOptions {
+  /**
+   * Agent mode, e.g. "build" or "plan".
+   * Only applied when creating a brand-new session; has no effect on an existing session.
+   */
+  agent?: string;
+  /**
+   * Model override in "providerID/modelID" format, e.g. "anthropic/claude-sonnet-4-6".
+   * Only applied when creating a brand-new session.
+   */
+  model?: string;
+  /**
+   * Reasoning effort hint passed to each prompt call: "low" | "medium" | "high".
+   */
+  reasoningEffort?: string;
+}
+
 export interface SendResult {
   /** The last assistant text extracted from the session. */
   reply: string;
@@ -35,10 +52,12 @@ export class SessionManager {
 
   /**
    * Ensure a session exists for the node.
-   * Reuses the cached ID, or creates a new one if none exists or the
-   * old one returns a 404.
+   * Reuses the cached ID, or creates a new one using the supplied options.
    */
-  async getOrCreateSession(node: OpenCodeNode): Promise<string> {
+  async getOrCreateSession(
+    node: OpenCodeNode,
+    options: SendOptions = {}
+  ): Promise<string> {
     const cached = this.sessionIds.get(node.name);
     if (cached) {
       // Trust the cached ID; if it's stale, sendPromptAsync will return 404
@@ -46,8 +65,11 @@ export class SessionManager {
       return cached;
     }
 
-    // Create a new session
-    const session = await node.createSession();
+    // Create a new session, forwarding agent/model options
+    const session = await node.createSession({
+      agent: options.agent,
+      model: options.model,
+    });
     this.sessionIds.set(node.name, session.id);
     return session.id;
   }
@@ -68,31 +90,40 @@ export class SessionManager {
   }
 
   /**
+   * Manually bind a node to an existing session ID.
+   * Used by fleet_switch_session.
+   */
+  setSessionId(nodeName: string, sessionId: string): void {
+    this.sessionIds.set(nodeName, sessionId);
+  }
+
+  /**
    * Send a prompt to a node and wait for the agent to finish.
    *
-   * Flow:
-   *  1. Ensure session exists (create if needed).
-   *  2. POST /session/:id/prompt_async
-   *  3. Poll GET /session/status until idle.
-   *  4. GET /session/:id/message to fetch last reply.
-   *
-   * @param node    Target OpenCodeNode.
-   * @param prompt  The prompt text to send.
-   * @returns       SendResult with reply text and raw messages.
+   * @param node     Target OpenCodeNode.
+   * @param prompt   The prompt text to send.
+   * @param options  Optional agent/model/reasoningEffort overrides.
    */
-  async send(node: OpenCodeNode, prompt: string): Promise<SendResult> {
-    let sessionId = await this.getOrCreateSession(node);
+  async send(
+    node: OpenCodeNode,
+    prompt: string,
+    options: SendOptions = {}
+  ): Promise<SendResult> {
+    let sessionId = await this.getOrCreateSession(node, options);
 
     // Attempt to send; on 404 recreate and retry once
     try {
-      await node.sendPromptAsync(sessionId, prompt);
+      await node.sendPromptAsync(sessionId, prompt, options.reasoningEffort);
     } catch (err: unknown) {
       if (isNotFound(err)) {
         this.sessionIds.delete(node.name);
-        const session = await node.createSession();
+        const session = await node.createSession({
+          agent: options.agent,
+          model: options.model,
+        });
         sessionId = session.id;
         this.sessionIds.set(node.name, sessionId);
-        await node.sendPromptAsync(sessionId, prompt);
+        await node.sendPromptAsync(sessionId, prompt, options.reasoningEffort);
       } else {
         throw err;
       }
