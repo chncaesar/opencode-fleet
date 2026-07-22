@@ -142,6 +142,15 @@ If the deadline (set by `--timeout`) is reached before the session goes idle, a 
 
 All traffic is plain HTTP. Use a VPN or SSH tunnel when communicating over untrusted networks. Passwords are transmitted as HTTP Basic Auth — adequate for a trusted LAN, not for public internet.
 
+## More OpenCode Tools
+
+| Tool | Description |
+|------|-------------|
+| [opencode-db-clean](https://github.com/chncaesar/opencode-db-clean) | Reclaim disk space from bloated SQLite databases |
+| [opencode-waitfor](https://github.com/chncaesar/opencode-waitfor) | `wait_for` for HTTP/TCP/command readiness checks |
+| [opencode-session-reflection](https://github.com/chncaesar/opencode-session-reflection) | Qualitative review of past coding sessions |
+| [opencode-fleet](https://github.com/chncaesar/opencode-fleet) | Multi-node remote OpenCode orchestration |
+
 ## License
 
 MIT
