@@ -4,7 +4,7 @@ Instructions for AI agents (OpenCode, Claude, etc.) operating in this repository
 
 ## What this project is
 
-`opencode-fleet` is an MCP server written in TypeScript. It allows a master OpenCode instance to coordinate multiple remote OpenCode nodes by exposing five MCP tools (`fleet_*`). The master agent calls these tools; the fleet server translates them into OpenCode REST API calls on each remote node.
+`opencode-fleet` is an MCP server written in TypeScript. It allows a master OpenCode instance to coordinate multiple remote OpenCode nodes by exposing `fleet_*` MCP tools. The master agent calls these tools; the fleet server translates them into OpenCode REST API calls on each remote node.
 
 ## Repository layout
 
@@ -62,6 +62,7 @@ HTTP Basic Auth using `--password` / `--username` CLI args or `FLEET_PASSWORD` /
 | `POST /session/:id/prompt_async` | Send prompt (non-blocking) |
 | `GET /session/:id/message?limit=N` | Fetch messages |
 | `GET /event` | SSE stream for idle detection |
+| `POST /session/:id/abort` | Abort a running session (returns boolean) |
 
 ### Response shape for `GET /session/:id/message`
 
