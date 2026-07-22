@@ -14,6 +14,7 @@
  *   fleet_create_session     — create a new session and bind to it
  *   fleet_switch_session     — switch to an existing session
  *   fleet_list_models        — list available models on a node
+ *   fleet_interrupt_session  — send abort signal to a running session
  */
 
 import { OpenCodeNode } from "./node.js";
@@ -251,6 +252,25 @@ export const TOOL_DEFINITIONS = [
       "List all available models on a remote OpenCode node. " +
       "Returns the model IDs in \"providerID/modelID\" format that can be passed to " +
       "fleet_send_message or fleet_create_session.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        node: {
+          type: "string",
+          description: "Name of the target node.",
+        },
+      },
+      required: ["node"],
+    },
+  },
+  {
+    name: "fleet_interrupt_session",
+    description:
+      "Send an abort signal to the currently running task on a remote node's active session. " +
+      "Fire-and-forget: returns immediately after the signal is sent. " +
+      "Does NOT wait for the session to become idle, does NOT reset the session binding, " +
+      "and does NOT delete the session. " +
+      "Use this when you want to stop a long-running task early (like Ctrl+C).",
     inputSchema: {
       type: "object",
       properties: {
@@ -696,6 +716,42 @@ export async function handleListModels(
   }
 }
 
+// fleet_interrupt_session ─────────────────────────────────────────────────────
+
+export async function handleInterruptSession(
+  ctx: FleetContext,
+  args: Record<string, unknown>
+): Promise<ToolResult> {
+  const nodeName = String(args["node"] ?? "");
+  if (!nodeName) return err("Missing required argument: node");
+
+  const node = ctx.nodes.get(nodeName);
+  if (!node) {
+    return err(
+      `Unknown node "${nodeName}". Available: ${Array.from(ctx.nodes.keys()).join(", ")}`
+    );
+  }
+
+  const sessionId = ctx.sessions.getSessionId(nodeName);
+  if (!sessionId) {
+    return err(
+      `Node "${nodeName}" has no active session. Use fleet_send_message to start one first.`
+    );
+  }
+
+  try {
+    const acknowledged = await node.abortSession(sessionId);
+    return ok(
+      acknowledged
+        ? `Abort signal sent to session ${sessionId} on "${nodeName}". The session acknowledged the abort.`
+        : `Abort signal sent to session ${sessionId} on "${nodeName}". The session may not have been running.`
+    );
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return err(`Failed to send abort signal to "${nodeName}": ${msg}`);
+  }
+}
+
 // ── Dispatcher ────────────────────────────────────────────────────────────────
 
 export async function dispatchTool(
@@ -722,6 +778,8 @@ export async function dispatchTool(
       return handleSwitchSession(ctx, args);
     case "fleet_list_models":
       return handleListModels(ctx, args);
+    case "fleet_interrupt_session":
+      return handleInterruptSession(ctx, args);
     default:
       return err(`Unknown tool: ${toolName}`);
   }
