@@ -255,6 +255,15 @@ export class OpenCodeNode {
     await this.request<unknown>("DELETE", `/session/${sessionId}`);
   }
 
+  /**
+   * Send an abort signal to a running session.
+   * Returns true if the session acknowledged the abort, false if it was not running.
+   * This is fire-and-forget — it does NOT wait for the session to become idle.
+   */
+  async abortSession(sessionId: string): Promise<boolean> {
+    return this.request<boolean>("POST", `/session/${sessionId}/abort`);
+  }
+
   // ── Messaging ───────────────────────────────────────────────────────────────
 
   /**
