@@ -11,11 +11,23 @@ Instructions for AI agents (OpenCode, Claude, etc.) operating in this repository
 ```
 src/
   config.ts   — CLI argument parsing → FleetConfig
-  node.ts     — HTTP client for one remote OpenCode node (REST + SSE)
+  node.ts     — HTTP client for one remote OpenCode node (REST + persistent SSE)
   session.ts  — Per-node session lifecycle (create, reuse, reset)
   tools.ts    — MCP tool definitions and handlers
   index.ts    — MCP Server stdio entry point
 dist/         — Compiled JS output (tsc, gitignored)
+tests/
+  node.test.ts       — Unit tests (mocked fetch, 17 tests)
+  tools.test.ts      — Unit tests (mocked SessionManager, 9 tests)
+  e2e/
+    helpers/
+      env.ts         — Env var reading, skipIf guards, prompt factories
+      harness.ts     — before/after hooks for session cleanup
+    node.e2e.ts      — Live-node tests: ping, sessions, messages, waitForIdle, getSessionStatus
+    session.e2e.ts   — SessionManager live tests: lazy create, reuse, 404 rebuild, timeout
+    tools.e2e.ts     — All 11 fleet_* tool handlers against live nodes + dual-node tests
+vitest.e2e.config.ts  — E2E vitest config (60s timeout, forks, verbose)
+.env.e2e.example      — Template for E2E environment variables
 examples/
   opencode.json  — Sample master opencode.json with fleet MCP config
 ```
@@ -29,25 +41,26 @@ npm run build     # tsc, output → dist/
 Run automated tests with:
 
 ```bash
-npm test     # vitest, 26 assertions across node.test.ts + tools.test.ts
+npm test          # vitest, 26 unit tests (zero dependency, mocked HTTP)
+npm run test:e2e  # vitest, 33 live tests (requires a running opencode slave node)
 ```
 
-Additional verification: run the built binary against a live OpenCode node (see README for slave setup).
+E2E tests require environment variables — see `.env.e2e.example`. If no nodes are configured, all E2E tests are skipped gracefully.
 
 ## Key design decisions
 
-### SSE-only completion detection (`node.ts`)
+### Persistent SSE status stream (`node.ts` — `StatusStream`)
 
-`waitForIdle()` calls `waitForIdleViaSSE()` directly — there is no fallback path.
+The status tracking mirrors the OpenCode desktop architecture (`packages/app/src/context/server-sdk.tsx`):
 
-`waitForIdleViaSSE()` opens `GET /event` with an `AbortController` deadline, reads the SSE stream line by line, and resolves the moment a matching idle event arrives for the target session:
+- **Persistent connection**: One `GET /event` SSE stream is opened per `OpenCodeNode` instance on construction (active start, not lazy). The connection is shared by all callers — no new HTTP request per `waitForIdle()` call.
+- **Local status cache**: Every `session.status` event writes into `statusCache: Map<sessionID, SessionStatus>`. `getSessionStatus()` reads this cache — O(1), zero network. This mirrors the desktop's `session_status` store.
+- **Idle waiters**: `waitForIdle(sessionId, timeoutMs)` registers a one-shot callback in `idleWaiters`. The moment the shared SSE stream emits `session.status: idle` for that session, the waiter resolves. No race condition — all callers share the same stream.
+- **Heartbeat & reconnect**: 15s silence triggers an abort + reconnect with fixed 250ms delay — identical constants to the desktop's `HEARTBEAT_TIMEOUT_MS` and `RECONNECT_DELAY_MS`.
+- **Optimistic busy**: `sendPromptAsync()` immediately writes `{ type: "busy" }` to the cache after the HTTP call returns, before the first SSE event arrives. This eliminates the race window between sending a prompt and the SSE event propagating — mirroring `submit.ts:60` in the desktop.
+- **Destroy**: `node.destroy()` aborts the SSE stream and rejects all pending waiters.
 
-- `session.status` with `properties.status.type === "idle"` and `properties.sessionID === sessionId`
-- `session.idle` with `properties.sessionID === sessionId` (deprecated, still emitted)
-
-Both `properties` (legacy `GET /event`) and `data` (v2 `GET /api/event`) field names are checked.
-
-If the deadline fires, `AbortController.abort()` cancels the stream and a `TimeoutError` is thrown. If the stream ends without an idle event, a `TimeoutError` is also thrown. `NodeError` (non-200 HTTP response) propagates to the caller unchanged.
+Why not `/api/session/active`: The desktop client never uses this endpoint — it relies entirely on SSE events. Our implementation now does the same. The `/api/session/active` endpoint was removed from `getSessionStatus()` after testing showed it is unreliable across opencode deployments.
 
 ### Session lifecycle (`session.ts`)
 
@@ -67,32 +80,44 @@ HTTP Basic Auth using `--password` / `--username` CLI args or `FLEET_PASSWORD` /
 | `DELETE /session/:id` | Delete session |
 | `GET /api/model` | List available models |
 | `POST /session/:id/prompt_async` | Send prompt (non-blocking, returns 204) |
-| `POST /session/:id/prompt` | Send prompt (blocking, returns 200) |
 | `GET /session/:id/message?limit=N` | Fetch newest N messages (ascending order; no /api prefix) |
-| `GET /api/session/active` | Map of running sessions — returns `{data:{[sessionID]:{type:"running"}}}` |
-| `GET /event` | SSE stream for idle detection (no /api prefix) |
+| `GET /event` | SSE stream — persistent, shared by all callers on the same OpenCodeNode instance |
 | `POST /api/session/:id/interrupt` | Interrupt a running session |
 
 **Important path quirks (confirmed against opencode 1.18.4):**
 - Endpoints with `/api` prefix return `{data: [...], cursor: {...}}` wrapped responses
 - Endpoints *without* `/api` prefix return bare arrays/objects (legacy format)
 - `GET /session/:id/message` returns newest N messages in **ascending** order (oldest-in-slice first, newest at index N-1)
-- `GET /api/session/active` returns `{data: {[sessionID]: {type: "running"}}}` — must unwrap `.data` before checking session presence
+
+### SSE event format
+
+`GET /event` emits JSON payloads in `data:` lines. The event shape:
+
+```json
+{
+  "id": "evt_xxx",
+  "type": "session.status",
+  "properties": {
+    "sessionID": "ses_xxx",
+    "status": { "type": "busy" }   // or { "type": "idle" }
+  }
+}
+```
+
+Both `properties` (legacy `GET /event`) and `data` (v2 `GET /api/event`) field names are checked in `applyEvent()`. The deprecated `session.idle` event type is also handled.
 
 ### Response shape for `GET /session/:id/message`
 
-Returns `MessageWithParts[]` — each element is `{ info: Message, parts: Part[] }`, not a flat `Message[]`. The `info` field carries role/error; `parts` carries `TextPart` and other variants.
-
-```json
-{ "parts": [{ "type": "text", "text": "<prompt string>" }] }
-```
+Returns `MessageWithParts[]` — each element is `{ info: Message, parts: Part[] }`, not a flat `Message[]`. The `info` field carries role/error; `parts` carries `TextPart`, `StepStartPart`, `StepFinishPart`, `ToolPart`, and other variants.
 
 ## Extending the tool set
 
 1. Add a new tool definition object to the `TOOL_DEFINITIONS` array in `src/tools.ts`.
 2. Add a handler function (`handleMyTool`) in the same file.
 3. Add a `case "my_tool":` branch in `dispatchTool()`.
-4. Run `npm run build` to verify types.
+4. Add a unit test in `tests/tools.test.ts` (mocked `FleetContext`).
+5. Add an E2E test in `tests/e2e/tools.e2e.ts` (against a live node).
+6. Run `npm run build` to verify types.
 
 ## Fleet operation protocol for master agents
 
@@ -150,9 +175,12 @@ fleet_send_message returns
 | Stop a running task (keep session) | `fleet_interrupt_session` |
 | Discard session and start fresh | `fleet_reset_session` (last resort) |
 
+## Implementation notes
 
-
-- **`waitForIdleViaSSE` resolves only once** — do not reuse the same SSE connection across multiple prompts. Each `send()` call opens and closes its own connection.
-- **SSE stream is global** — `GET /event` emits events for *all* sessions on the node. Always filter by `sessionID` before acting on an event.
-- **Node 18+ required** — the implementation uses native `fetch` with `ReadableStream`. Do not polyfill or replace with `node-fetch`.
-- **No polling fallback** — if `GET /event` returns a non-200, a `NodeError` is thrown immediately. There is no silent retry or polling path.
+- **Persistent SSE, not per-call**: The `StatusStream` is opened once per `OpenCodeNode` instance and shared. `waitForIdle()` registers a waiter on the shared stream rather than opening a new HTTP connection.
+- **SSE stream is global**: `GET /event` emits events for *all* sessions on the node. Always filter by `sessionID` before acting on an event.
+- **Bootstrap**: No separate bootstrap phase needed — the SSE stream receives `session.status: busy` events the moment any prompt starts executing. Combined with the optimistic busy write in `sendPromptAsync()`, there is no time window where `getSessionStatus()` returns a stale `idle`.
+- **Node 18+ required**: The implementation uses native `fetch` with `ReadableStream`. Do not polyfill or replace with `node-fetch`.
+- **`destroy()` required**: In long-running processes, call `node.destroy()` when a node is no longer needed to close the SSE connection and prevent resource leaks. The MCP server entry point (`index.ts`) does not call destroy — fine for short-lived stdio servers. Tests and long-lived apps should.
+- **Testing**: Unit tests use `vitest` mocking; `getSessionStatus` tests inject status directly via `injectStatusForTesting()`. E2E tests hit live opencode slave nodes and require `E2E_NODE_*` environment variables — skipped silently if unset.
+- **Dual-node E2E tests**: The concurrent send and cross-node isolation tests require both nodes configured. They use `describe.skipIf(skipIfNotBothNodes)`.

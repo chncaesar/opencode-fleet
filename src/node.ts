@@ -146,12 +146,275 @@ export interface MessageWithParts {
   parts: Part[];
 }
 
+// ── StatusStream ─────────────────────────────────────────────────────────────
+
+/**
+ * Persistent SSE subscriber for a single OpenCode node.
+ *
+ * Mirrors the desktop architecture (packages/app/src/context/server-sdk.tsx):
+ *   - Opens GET /event on construction, reconnects on error/timeout.
+ *   - Maintains a local statusCache: Map<sessionId, SessionStatus>.
+ *   - Fires idle waiters registered by waitForIdle().
+ *   - 15s heartbeat timeout triggers reconnect (same as desktop).
+ *   - Fixed 250ms reconnect delay (same as desktop RECONNECT_DELAY_MS).
+ *   - destroy() closes the stream permanently.
+ */
+class StatusStream {
+  /** Live status for every session seen since last (re)connect. */
+  readonly statusCache = new Map<string, SessionStatus>();
+
+  /**
+   * Pending waiters per session: each entry is a Set of { resolve, reject }
+   * pairs waiting for that session to become idle.
+   */
+  private readonly idleWaiters = new Map<
+    string,
+    Set<{ resolve: () => void; reject: (err: unknown) => void }>
+  >();
+
+  private destroyed = false;
+  private abortCtrl = new AbortController();
+
+  // Mirrors desktop constants
+  private static readonly HEARTBEAT_TIMEOUT_MS = 15_000;
+  private static readonly RECONNECT_DELAY_MS = 250;
+
+  constructor(
+    private readonly baseUrl: string,
+    private readonly authHeaders: Record<string, string>
+  ) {
+    // Start immediately — same as desktop's onMount (not lazy).
+    void this.loop();
+  }
+
+  // ── Public API ──────────────────────────────────────────────────────────────
+
+  /**
+   * Return the cached status for a session.
+   * O(1), zero network — reads the local cache populated by the SSE stream.
+   * Returns idle for any session not yet seen (conservative default).
+   */
+  getStatus(sessionId: string): SessionStatus {
+    return this.statusCache.get(sessionId) ?? { type: "idle" };
+  }
+
+  /**
+   * Register a one-shot waiter that resolves when the session emits
+   * session.status: idle.  Times out with TimeoutError after timeoutMs.
+   *
+   * Mirrors desktop logic: only resolve immediately if the cache
+   * *explicitly* shows idle.  If the session is not yet in the cache,
+   * we must wait — the SSE stream may not have received the first
+   * session.status: busy event yet.
+   */
+  waitForIdle(sessionId: string, timeoutMs: number): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      // Only short-circuit if we have an explicit idle status in cache.
+      // "not in cache" ≠ idle — it means we haven't heard from this session yet.
+      const cached = this.statusCache.get(sessionId);
+      if (cached?.type === "idle") {
+        resolve();
+        return;
+      }
+
+      const entry = { resolve, reject };
+
+      let waiters = this.idleWaiters.get(sessionId);
+      if (!waiters) {
+        waiters = new Set();
+        this.idleWaiters.set(sessionId, waiters);
+      }
+      waiters.add(entry);
+
+      const timer = setTimeout(() => {
+        const w = this.idleWaiters.get(sessionId);
+        if (w) {
+          w.delete(entry);
+          if (w.size === 0) this.idleWaiters.delete(sessionId);
+        }
+        reject(
+          new TimeoutError(
+            `Session ${sessionId} did not become idle within ${timeoutMs}ms`
+          )
+        );
+      }, timeoutMs);
+
+      // Wrap resolve/reject so we always clear the timer.
+      const originalResolve = entry.resolve;
+      const originalReject = entry.reject;
+      entry.resolve = () => { clearTimeout(timer); originalResolve(); };
+      entry.reject = (err: unknown) => { clearTimeout(timer); originalReject(err); };
+    });
+  }
+
+  /** Permanently close the SSE connection and reject all pending waiters. */
+  destroy(): void {
+    this.destroyed = true;
+    this.abortCtrl.abort();
+    const err = new NodeError("StatusStream destroyed");
+    for (const waiters of this.idleWaiters.values()) {
+      for (const w of waiters) w.reject(err);
+    }
+    this.idleWaiters.clear();
+  }
+
+  // ── Reconnect loop ──────────────────────────────────────────────────────────
+
+  /**
+   * Outer reconnect loop — mirrors desktop's while(!abort.signal.aborted) loop.
+   * Reconnects with fixed 250ms delay after any stream error or heartbeat timeout.
+   */
+  private async loop(): Promise<void> {
+    while (!this.destroyed) {
+      // Each attempt gets its own AbortController for heartbeat cancellation.
+      const attempt = new AbortController();
+
+      // Cancel this attempt if the whole stream is destroyed.
+      const onDestroy = () => attempt.abort();
+      this.abortCtrl.signal.addEventListener("abort", onDestroy, { once: true });
+
+      try {
+        await this.connect(attempt.signal);
+      } catch {
+        // Swallow — reconnect after delay unless destroyed.
+      } finally {
+        this.abortCtrl.signal.removeEventListener("abort", onDestroy);
+        attempt.abort();
+      }
+
+      if (this.destroyed) break;
+
+      await sleep(StatusStream.RECONNECT_DELAY_MS);
+    }
+  }
+
+  /**
+   * Open GET /event, parse the SSE stream, update statusCache, fire waiters.
+   * Mirrors desktop's `connect` attempt inside the while loop.
+   *
+   * Heartbeat: any event resets the timer; 15s silence aborts → reconnect.
+   */
+  private async connect(signal: AbortSignal): Promise<void> {
+    // Heartbeat timer — reset on every event received.
+    let heartbeatTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const resetHeartbeat = () => {
+      if (heartbeatTimer !== undefined) clearTimeout(heartbeatTimer);
+      heartbeatTimer = setTimeout(() => {
+        (signal as AbortSignal & { __ctrl?: AbortController }).__ctrl?.abort();
+      }, StatusStream.HEARTBEAT_TIMEOUT_MS);
+    };
+
+    // We need a per-attempt controller to implement heartbeat abort.
+    // The caller passes us the signal; we create a child controller here.
+    const child = new AbortController();
+    signal.addEventListener("abort", () => child.abort(), { once: true });
+
+    // Store child on the signal so resetHeartbeat can abort it.
+    (signal as AbortSignal & { __ctrl?: AbortController }).__ctrl = child;
+
+    try {
+      const res = await fetch(`${this.baseUrl}/event`, {
+        method: "GET",
+        headers: { ...this.authHeaders, Accept: "text/event-stream", "Cache-Control": "no-cache" },
+        signal: child.signal,
+      });
+
+      if (!res.ok || !res.body) return; // Will reconnect.
+
+      resetHeartbeat();
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          resetHeartbeat();
+          buffer += decoder.decode(value, { stream: true });
+
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+
+          for (const line of lines) {
+            const trimmed = line.trimEnd();
+            if (!trimmed.startsWith("data:")) continue;
+            const jsonStr = trimmed.slice("data:".length).trim();
+            if (!jsonStr) continue;
+
+            let event: SseEvent;
+            try { event = JSON.parse(jsonStr) as SseEvent; }
+            catch { continue; }
+
+            this.applyEvent(event);
+          }
+        }
+      } finally {
+        clearTimeout(heartbeatTimer);
+        reader.cancel().catch(() => undefined);
+      }
+    } catch {
+      clearTimeout(heartbeatTimer);
+      // Propagate to loop() for reconnect.
+      throw new Error("SSE connect failed");
+    }
+  }
+
+  // ── Event handling ──────────────────────────────────────────────────────────
+
+  /**
+   * Apply one parsed SSE event to the local cache and fire any waiters.
+   * Mirrors desktop's server-session.ts apply() case "session.status".
+   */
+  private applyEvent(event: SseEvent): void {
+    const props = (event.properties ?? event.data) as Record<string, unknown> | undefined;
+    if (!props) return;
+
+    if (event.type === "session.status") {
+      const sessionId = props["sessionID"] as string | undefined;
+      if (!sessionId) return;
+
+      const status = props["status"] as SessionStatus | undefined;
+      if (!status) return;
+
+      // Write to cache (mirrors setData("session_status", ...))
+      this.statusCache.set(sessionId, status);
+
+      // Fire idle waiters
+      if (status.type === "idle") {
+        this.fireIdleWaiters(sessionId);
+      }
+      return;
+    }
+
+    if (event.type === "session.idle") {
+      // Deprecated but still emitted — treat as idle
+      const sessionId = props["sessionID"] as string | undefined;
+      if (!sessionId) return;
+      this.statusCache.set(sessionId, { type: "idle" });
+      this.fireIdleWaiters(sessionId);
+    }
+  }
+
+  private fireIdleWaiters(sessionId: string): void {
+    const waiters = this.idleWaiters.get(sessionId);
+    if (!waiters) return;
+    this.idleWaiters.delete(sessionId);
+    for (const w of waiters) w.resolve();
+  }
+}
+
 // ── OpenCodeNode ──────────────────────────────────────────────────────────────
 
 export class OpenCodeNode {
   readonly name: string;
   readonly baseUrl: string;
   private readonly authHeader: string;
+  /** Persistent SSE subscriber — started on construction, mirrors desktop. */
+  private readonly statusStream: StatusStream;
 
   constructor(config: NodeConfig, username: string, password: string) {
     this.name = config.name;
@@ -159,6 +422,22 @@ export class OpenCodeNode {
     this.baseUrl = config.url.replace(/\/$/, "");
     const credentials = Buffer.from(`${username}:${password}`).toString("base64");
     this.authHeader = password ? `Basic ${credentials}` : "";
+    // Start SSE stream immediately (main process, not lazy — same as desktop).
+    this.statusStream = new StatusStream(this.baseUrl, this.sseHeaders());
+  }
+
+  /** Permanently close the SSE stream. Call when the node is no longer needed. */
+  destroy(): void {
+    this.statusStream.destroy();
+  }
+
+  /**
+   * Inject a session status directly into the SSE cache.
+   * For testing only — allows unit tests to set up status without a live SSE stream.
+   * @internal
+   */
+  injectStatusForTesting(sessionId: string, status: SessionStatus): void {
+    this.statusStream.statusCache.set(sessionId, status);
   }
 
   // ── Private helpers ─────────────────────────────────────────────────────────
@@ -167,6 +446,16 @@ export class OpenCodeNode {
     const h: Record<string, string> = {
       "Content-Type": "application/json",
       Accept: "application/json",
+    };
+    if (this.authHeader) h["Authorization"] = this.authHeader;
+    return h;
+  }
+
+  /** Headers used for the persistent SSE connection. */
+  private sseHeaders(): Record<string, string> {
+    const h: Record<string, string> = {
+      Accept: "text/event-stream",
+      "Cache-Control": "no-cache",
     };
     if (this.authHeader) h["Authorization"] = this.authHeader;
     return h;
@@ -291,6 +580,10 @@ export class OpenCodeNode {
     };
     if (reasoningEffort) body["reasoning_effort"] = reasoningEffort;
     await this.request<unknown>("POST", `/session/${sessionId}/prompt_async`, body);
+    // Optimistic update — mirrors desktop submit.ts:60 which immediately sets
+    // session_status to busy before the SSE event arrives, eliminating the
+    // race window between sendPromptAsync returning and the first SSE event.
+    this.statusStream.statusCache.set(sessionId, { type: "busy" });
   }
 
   /**
@@ -308,114 +601,69 @@ export class OpenCodeNode {
   // ── Convenience ─────────────────────────────────────────────────────────────
 
   /**
-   * Wait for a session to become idle using Server-Sent Events.
+   * Wait for a session to become idle.
    *
-   * Connects to GET /event and listens for:
-   *   - session.status  { sessionID, status: { type: "idle" } }
-   *   - session.idle    { sessionID }  (deprecated but still emitted)
-   *
-   * The fetch is aborted via AbortController when the deadline is reached.
+   * Delegates to the persistent StatusStream which is driven by the shared
+   * GET /event SSE connection.  No new HTTP request is made; resolution
+   * happens the moment the SSE stream emits session.status: idle for this
+   * session — identical to how the desktop client tracks completion.
    *
    * @throws TimeoutError  if the session is still busy after timeoutMs.
-   * @throws NodeError     if the SSE connection fails (caller should fallback).
    */
   async waitForIdleViaSSE(
     sessionId: string,
     timeoutMs: number
   ): Promise<void> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-    try {
-      const res = await fetch(`${this.baseUrl}/event`, {
-        method: "GET",
-        headers: {
-          ...this.headers(),
-          Accept: "text/event-stream",
-          "Cache-Control": "no-cache",
-        },
-        signal: controller.signal,
-      });
-
-      if (!res.ok) {
-        const text = await res.text().catch(() => "");
-        throw new NodeError(
-          `GET /event → HTTP ${res.status}: ${text}`,
-          res.status
-        );
-      }
-
-      if (!res.body) {
-        throw new NodeError("GET /event returned no response body");
-      }
-
-      // Parse the SSE stream line by line
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-
-        // Process complete lines
-        const lines = buffer.split("\n");
-        // Keep the last (potentially incomplete) chunk in the buffer
-        buffer = lines.pop() ?? "";
-
-        for (const line of lines) {
-          const trimmed = line.trimEnd();
-
-          if (!trimmed.startsWith("data:")) continue;
-
-          const jsonStr = trimmed.slice("data:".length).trim();
-          if (!jsonStr) continue;
-
-          let event: SseEvent;
-          try {
-            event = JSON.parse(jsonStr) as SseEvent;
-          } catch {
-            continue; // malformed JSON — skip
-          }
-
-          if (isIdleEvent(event, sessionId)) {
-            // Session reached idle — clean up and resolve
-            reader.cancel().catch(() => undefined);
-            return;
-          }
-        }
-      }
-
-      // Stream ended without an idle event — treat as timeout
-      throw new TimeoutError(
-        `Session ${sessionId} on node "${this.name}" SSE stream ended without becoming idle`
-      );
-    } catch (err) {
-      if (isAbortError(err)) {
-        throw new TimeoutError(
-          `Session ${sessionId} on node "${this.name}" did not become idle within ${timeoutMs}ms (SSE timeout)`
-        );
-      }
-      throw err;
-    } finally {
-      clearTimeout(timer);
-    }
+    return this.statusStream.waitForIdle(sessionId, timeoutMs);
   }
 
   /**
-   * Wait for a session to become idle via SSE.
-   * Connects to GET /event and resolves when session.status(idle) arrives.
+   * Wait for a session to become idle.
+   * Delegates to waitForIdleViaSSE (persistent SSE stream).
    *
    * @throws TimeoutError  if the session is still busy after timeoutMs.
-   * @throws NodeError     if the SSE connection fails.
    */
-  async waitForIdle(
-    sessionId: string,
-    timeoutMs: number
-  ): Promise<void> {
+  async waitForIdle(sessionId: string, timeoutMs: number): Promise<void> {
     return this.waitForIdleViaSSE(sessionId, timeoutMs);
+  }
+
+  /**
+   * Query the current execution status of a session.
+   *
+   * Reads from the local statusCache maintained by the persistent SSE stream —
+   * O(1), zero network request.  This mirrors the desktop's session_working()
+   * helper which reads from the same SSE-driven store.
+   *
+   * Returns idle for sessions not yet seen in the stream (conservative default).
+   */
+  async getSessionStatus(sessionId: string): Promise<SessionStatus> {
+    return this.statusStream.getStatus(sessionId);
+  }
+
+  /**
+   * @deprecated The persistent SSE stream makes this unnecessary.
+   * Kept for backwards compatibility with existing callers and unit tests.
+   * Infers status from message history (step-finish scan).
+   * @internal
+   */
+  async getSessionStatusFallback(sessionId: string): Promise<SessionStatus> {
+    const messages = await this.request<MessageWithParts[]>(
+      "GET",
+      `/session/${sessionId}/message`
+    );
+
+    if (messages.length === 0) return { type: "idle" };
+
+    let lastUserIdx = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].info.role === "user") { lastUserIdx = i; break; }
+    }
+    if (lastUserIdx === -1) return { type: "idle" };
+
+    const hasStepFinish = messages
+      .slice(lastUserIdx + 1)
+      .some((m) => m.parts.some((p) => p.type === "step-finish"));
+    return { type: hasStepFinish ? "idle" : "busy" };
   }
 
   /**
@@ -469,78 +717,7 @@ export class OpenCodeNode {
     }
     return "";
   }
-
-  /**
-   * Query the current execution status of a session.
-   *
-   * Uses GET /session/active — the authoritative opencode endpoint that
-   * returns a map of { [sessionID]: { type: "running" } } for all sessions
-   * currently executing an agent loop. A session is present → busy;
-   * absent → idle.
-   *
-   * This is O(1) and works correctly even for brand-new sessions that
-   * haven't emitted any messages yet (the old message-scan approach would
-   * incorrectly report them as idle).
-   *
-   * Falls back to the message-scan heuristic if the /session/active
-   * endpoint returns an unexpected shape (forward-compatibility).
-   *
-   * @throws NodeError if the HTTP request fails.
-   */
-  async getSessionStatus(sessionId: string): Promise<SessionStatus> {
-    const response = await this.request<{ data: Record<string, { type: string }> }>(
-      "GET",
-      "/api/session/active"
-    );
-
-    // /api/session/active returns { data: { [sessionID]: { type: "running" } } }
-    const active = response.data ?? (response as unknown as Record<string, { type: string }>);
-
-    // If the session appears in the active map, it is running.
-    if (Object.prototype.hasOwnProperty.call(active, sessionId)) {
-      return { type: "busy" };
-    }
-
-    // Not in the active map → idle.
-    return { type: "idle" };
-  }
-
-  /**
-   * Fallback: infer session status by scanning message history for a
-   * step-finish part after the last user message. Used as a degraded
-   * alternative when /session/active is unavailable.
-   *
-   * @internal
-   */
-  async getSessionStatusFallback(sessionId: string): Promise<SessionStatus> {
-    const messages = await this.request<MessageWithParts[]>(
-      "GET",
-      `/session/${sessionId}/message`
-    );
-
-    if (messages.length === 0) {
-      return { type: "idle" };
-    }
-
-    let lastUserIdx = -1;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].info.role === "user") {
-        lastUserIdx = i;
-        break;
-      }
-    }
-
-    if (lastUserIdx === -1) {
-      return { type: "idle" };
-    }
-
-    const hasStepFinish = messages
-      .slice(lastUserIdx + 1)
-      .some((m) => m.parts.some((p) => p.type === "step-finish"));
-
-    return { type: hasStepFinish ? "idle" : "busy" };
-  }
-}
+} // end OpenCodeNode
 
 // ── Custom errors ─────────────────────────────────────────────────────────────
 
@@ -577,33 +754,15 @@ interface SseEvent {
   data?: Record<string, unknown>;
 }
 
-/**
- * Return true if this SSE event signals that the given session is now idle.
- */
-function isIdleEvent(event: SseEvent, sessionId: string): boolean {
-  const props = (event.properties ?? event.data) as Record<string, unknown> | undefined;
-  if (!props) return false;
-
-  if (event.type === "session.status") {
-    if (props["sessionID"] !== sessionId) return false;
-    const status = props["status"] as { type?: string } | undefined;
-    return status?.type === "idle";
-  }
-
-  if (event.type === "session.idle") {
-    // Deprecated but still emitted — treat as idle
-    return props["sessionID"] === sessionId;
-  }
-
-  return false;
-}
-
-/**
- * Return true if an error is an AbortController abort signal.
- */
+/** Utility used by StatusStream.connect to detect fetch AbortController errors. */
 function isAbortError(err: unknown): boolean {
   if (err instanceof Error) {
     return err.name === "AbortError" || err.message.includes("aborted");
   }
   return false;
+}
+
+/** Async sleep helper used by StatusStream reconnect loop. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

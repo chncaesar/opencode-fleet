@@ -137,9 +137,8 @@ describe("extractLastReply", () => {
 
 // ── getSessionStatus ──────────────────────────────────────────────────────────
 //
-// getSessionStatus now uses GET /session/active which returns
-// { [sessionID]: { type: "running" } } for all currently-executing sessions.
-// Present → busy. Absent → idle. O(1), no message history needed.
+// getSessionStatus now reads from the persistent SSE status cache — O(1),
+// zero network.  Tests inject status directly via injectStatusForTesting().
 
 describe("getSessionStatus", () => {
   let node: OpenCodeNode;
@@ -149,59 +148,39 @@ describe("getSessionStatus", () => {
   });
 
   afterEach(() => {
+    node.destroy();
     vi.restoreAllMocks();
   });
 
-  /**
-   * Mock fetch to return a /api/session/active response.
-   * The real API wraps the map in { data: { ... } }.
-   * activeSessions is the inner map of running session IDs.
-   */
-  function mockActive(activeSessions: Record<string, { type: string }>) {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue({
-        ok: true,
-        text: () => Promise.resolve(JSON.stringify({ data: activeSessions })),
-      })
-    );
-  }
-
-  it("returns busy when session appears in /session/active", async () => {
-    mockActive({ s1: { type: "running" } });
+  it("returns busy when SSE cache has session marked busy", async () => {
+    node.injectStatusForTesting("s1", { type: "busy" });
     const status = await node.getSessionStatus("s1");
     expect(status.type).toBe("busy");
   });
 
-  it("returns idle when session is absent from /session/active", async () => {
-    // Different session is running, but not s1
-    mockActive({ other_session: { type: "running" } });
+  it("returns idle when session is absent from SSE cache (default)", async () => {
+    // s1 was never seen in the stream → default idle
     const status = await node.getSessionStatus("s1");
     expect(status.type).toBe("idle");
   });
 
-  it("returns idle when /session/active map is empty", async () => {
-    mockActive({});
+  it("returns idle when SSE cache explicitly has session idle", async () => {
+    node.injectStatusForTesting("s1", { type: "idle" });
     const status = await node.getSessionStatus("s1");
     expect(status.type).toBe("idle");
   });
 
-  it("returns idle when multiple other sessions are active but not ours", async () => {
-    mockActive({
-      ses_abc: { type: "running" },
-      ses_def: { type: "running" },
-      ses_ghi: { type: "running" },
-    });
+  it("returns idle when other sessions are busy but not ours", async () => {
+    node.injectStatusForTesting("ses_abc", { type: "busy" });
+    node.injectStatusForTesting("ses_def", { type: "busy" });
     const status = await node.getSessionStatus("s1");
     expect(status.type).toBe("idle");
   });
 
-  it("returns busy when target session is among multiple active sessions", async () => {
-    mockActive({
-      ses_abc: { type: "running" },
-      s1: { type: "running" },
-      ses_def: { type: "running" },
-    });
+  it("returns busy when target session is busy among multiple sessions", async () => {
+    node.injectStatusForTesting("ses_abc", { type: "busy" });
+    node.injectStatusForTesting("s1", { type: "busy" });
+    node.injectStatusForTesting("ses_def", { type: "busy" });
     const status = await node.getSessionStatus("s1");
     expect(status.type).toBe("busy");
   });
