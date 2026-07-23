@@ -12,7 +12,7 @@
  * creates a new one.
  */
 
-import { OpenCodeNode, type MessageWithParts } from "./node.js";
+import { OpenCodeNode, TimeoutError, type MessageWithParts } from "./node.js";
 import type { FleetConfig } from "./config.js";
 
 export interface SendOptions {
@@ -42,6 +42,13 @@ export interface SendResult {
   reply: string;
   /** True if the session returned an error part. */
   hasError: boolean;
+  /**
+   * True if the wait timed out before the agent became idle.
+   * The agent is likely STILL RUNNING on the remote node.
+   * Do NOT reset the session on timeout — use fleet_get_session_status to
+   * check the agent's state and fleet_interrupt_session if you need to stop it.
+   */
+  timedOut: boolean;
   /** Raw messages (newest-first) at time of completion. */
   messages: MessageWithParts[];
 }
@@ -136,8 +143,21 @@ export class SessionManager {
       }
     }
 
-    // Wait for idle via SSE
-    await node.waitForIdle(sessionId, this.timeoutMs);
+    // Wait for idle via SSE; a TimeoutError means the agent is still running —
+    // it is NOT a failure.  We capture it, fetch partial messages, and surface
+    // a diagnostic reply so the master can decide what to do next.
+    let timedOut = false;
+    try {
+      await node.waitForIdle(sessionId, this.timeoutMs);
+    } catch (waitErr: unknown) {
+      if (waitErr instanceof TimeoutError) {
+        timedOut = true;
+        // Fall through — fetch whatever messages are available so the master
+        // can see tool activity and make an informed decision.
+      } else {
+        throw waitErr;
+      }
+    }
 
     // Fetch last messages
     const messages = await node.getMessages(sessionId, 10);
@@ -150,7 +170,7 @@ export class SessionManager {
         (mwp.info as { error?: unknown }).error != null
     );
 
-    return { reply, hasError, messages };
+    return { reply, hasError, timedOut, messages };
   }
 }
 

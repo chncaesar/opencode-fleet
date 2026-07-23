@@ -111,10 +111,16 @@ Environment variable fallbacks: `FLEET_PASSWORD`, `FLEET_USERNAME`, `OPENCODE_SE
 | Tool | Description |
 |---|---|
 | `fleet_list_nodes` | List all configured nodes and their health/latency. |
-| `fleet_send_message` | Send a prompt to a node and wait for the reply. |
-| `fleet_get_session_messages` | Fetch message history from a node's session. |
-| `fleet_reset_session` | Discard a node's session so the next call starts fresh. |
 | `fleet_node_health` | Check if a specific node is reachable. |
+| `fleet_list_models` | List all models available on a node. |
+| `fleet_list_sessions` | List all sessions on a node. |
+| `fleet_create_session` | Create a new session on a node with optional title, agent, and model. |
+| `fleet_switch_session` | Bind to an existing session by ID (for tools that target the "current" session). |
+| `fleet_send_message` | Send a prompt to a node and wait for the reply. |
+| `fleet_get_session_messages` | Fetch recent message history from a node's session. |
+| `fleet_get_session_status` | Check whether a node's session is idle or busy (without sending a message). |
+| `fleet_interrupt_session` | Signal a running session to stop (fire-and-forget; does not reset). |
+| `fleet_reset_session` | Discard a node's session so the next call starts fresh (last resort). |
 
 ## Example usage (in OpenCode chat)
 
@@ -136,7 +142,7 @@ The fleet server maintains one session per node in memory. Sessions are created 
 
 `fleet_send_message` subscribes to the node's SSE event stream (`GET /event`) and resolves the moment a `session.status { type: "idle" }` event arrives. This means no unnecessary waiting — the master gets the reply as soon as the remote agent finishes.
 
-If the deadline (set by `--timeout`) is reached before the session goes idle, a `TimeoutError` is raised and returned as a tool error.
+If the deadline (set by `--timeout`) is reached before the session goes idle, `fleet_send_message` returns a **non-error result** with a `Status: TIMEOUT` header and recommended next steps. The slave session is still running — do not reset it. Use `fleet_get_session_status` to check progress, and `fleet_interrupt_session` if you need to stop it.
 
 ## Security
 

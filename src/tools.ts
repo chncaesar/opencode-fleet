@@ -130,6 +130,11 @@ export const TOOL_DEFINITIONS = [
           type: "string",
           description: "Name of the target node.",
         },
+        session_id: {
+          type: "string",
+          description:
+            "Optional explicit session ID to query. If omitted, uses the node's active session binding.",
+        },
         limit: {
           type: "number",
           description: "Maximum number of messages to return (default: 50, max: 200).",
@@ -143,7 +148,11 @@ export const TOOL_DEFINITIONS = [
     description:
       "Reset (discard) the current session for a node. " +
       "The next fleet_send_message call will start a fresh session. " +
-      "Use this to clear context when a node seems confused or stuck.",
+      "Use this to clear context when a node seems confused or stuck. " +
+      "WARNING: will be blocked if the session is currently BUSY — use " +
+      "fleet_get_session_status to check first, then fleet_interrupt_session if needed. " +
+      "Resetting a busy session loses in-flight work and context. " +
+      "This is a LAST RESORT — prefer waiting or interrupting over resetting.",
     inputSchema: {
       type: "object",
       properties: {
@@ -282,6 +291,30 @@ export const TOOL_DEFINITIONS = [
       required: ["node"],
     },
   },
+  {
+    name: "fleet_get_session_status",
+    description:
+      "Check whether a specific remote node's session is currently idle or busy. " +
+      "Returns idle/busy/retry status without sending any new messages. " +
+      "Use this after a fleet_send_message timeout to confirm whether the agent is still " +
+      "running before deciding whether to wait, interrupt, or reset. " +
+      "If session_id is omitted, checks the currently bound session for the node.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        node: {
+          type: "string",
+          description: "Name of the target node.",
+        },
+        session_id: {
+          type: "string",
+          description:
+            "Optional session ID to check. If omitted, uses the currently bound session.",
+        },
+      },
+      required: ["node"],
+    },
+  },
 ] as const;
 
 // ── Tool handlers ─────────────────────────────────────────────────────────────
@@ -355,6 +388,27 @@ export async function handleSendMessage(
 
     const lines: string[] = [];
     lines.push(`Node: ${nodeName}`);
+
+    if (result.timedOut) {
+      lines.push(`Status: TIMEOUT — agent is still running (not a failure)`);
+      lines.push(`Session: ${ctx.sessions.getSessionId(nodeName) ?? "(unknown)"}`);
+      lines.push("");
+      lines.push("The remote agent did not finish within the timeout window.");
+      lines.push("It is STILL RUNNING. Do NOT reset the session.");
+      lines.push("");
+      lines.push("Recommended next steps:");
+      lines.push("  1. Call fleet_get_session_status to check if still busy.");
+      lines.push("  2. Call fleet_get_session_messages to see current progress.");
+      lines.push("  3. Wait and retry fleet_send_message with a follow-up prompt.");
+      lines.push("  4. Call fleet_interrupt_session only if you need to stop it early.");
+      lines.push("  5. LAST RESORT: fleet_reset_session (loses all session context).");
+      lines.push("");
+      lines.push("--- Partial output (agent still working) ---");
+      lines.push(result.reply || "(no output yet — agent may be in early tool-call phase)");
+      // Timeout is not an error — master should not panic-reset
+      return ok(lines.join("\n"));
+    }
+
     lines.push(`Status: ${result.hasError ? "completed with error" : "completed"}`);
     lines.push("");
     lines.push("--- Reply ---");
@@ -470,7 +524,9 @@ export async function handleGetSessionMessages(
     );
   }
 
-  const sessionId = ctx.sessions.getSessionId(nodeName);
+  // Accept an explicit session_id argument; fall back to the active binding.
+  const explicitId = args["session_id"] ? String(args["session_id"]) : undefined;
+  const sessionId = explicitId ?? ctx.sessions.getSessionId(nodeName);
   if (!sessionId) {
     return ok(`Node "${nodeName}" has no active session. Use fleet_send_message to start one.`);
   }
@@ -521,6 +577,30 @@ export async function handleResetSession(
   }
 
   const oldId = ctx.sessions.getSessionId(nodeName);
+
+  // Guard: refuse to reset while the session is busy, to prevent losing
+  // in-flight work.  If status check fails (endpoint not supported), warn
+  // but allow the reset to proceed.
+  if (oldId) {
+    const node = ctx.nodes.get(nodeName)!;
+    try {
+      const status = await node.getSessionStatus(oldId);
+      if (status.type === "busy") {
+        return err(
+          `RESET BLOCKED — session ${oldId} on "${nodeName}" is currently BUSY.\n` +
+            `Resetting now would discard in-flight work and lose session context.\n\n` +
+            `Recommended actions:\n` +
+            `  1. Wait for the task to finish, then check fleet_get_session_messages.\n` +
+            `  2. Call fleet_interrupt_session to stop the running task gracefully.\n` +
+            `  3. If you are sure you want to discard the session anyway, interrupt first, ` +
+            `then reset.`
+        );
+      }
+    } catch {
+      // Status endpoint not available or unreachable — proceed with reset but warn.
+    }
+  }
+
   ctx.sessions.resetSession(nodeName);
 
   return ok(
@@ -752,6 +832,62 @@ export async function handleInterruptSession(
   }
 }
 
+// fleet_get_session_status ─────────────────────────────────────────────────────
+
+export async function handleGetSessionStatus(
+  ctx: FleetContext,
+  args: Record<string, unknown>
+): Promise<ToolResult> {
+  const nodeName = String(args["node"] ?? "");
+  if (!nodeName) return err("Missing required argument: node");
+
+  const node = ctx.nodes.get(nodeName);
+  if (!node) {
+    return err(
+      `Unknown node "${nodeName}". Available: ${Array.from(ctx.nodes.keys()).join(", ")}`
+    );
+  }
+
+  // Accept an explicit session_id argument; fall back to the active binding.
+  const explicitId = args["session_id"] ? String(args["session_id"]) : undefined;
+  const sessionId = explicitId ?? ctx.sessions.getSessionId(nodeName);
+  if (!sessionId) {
+    return ok(
+      `Node "${nodeName}" has no active session.\n` +
+        `Use fleet_send_message to start one.`
+    );
+  }
+
+  try {
+    const status = await node.getSessionStatus(sessionId);
+    const lines: string[] = [
+      `Node: ${nodeName}`,
+      `Session: ${sessionId}`,
+      `Status: ${status.type}`,
+    ];
+
+    if (status.type === "busy") {
+      lines.push("");
+      lines.push("The agent is currently executing. Do NOT reset the session.");
+      lines.push("Use fleet_get_session_messages to see current progress.");
+      lines.push("Use fleet_interrupt_session to stop it early if needed.");
+    } else if (status.type === "retry") {
+      const r = status as { type: "retry"; attempt: number; message: string; next: number };
+      lines.push(`Attempt: ${r.attempt}`);
+      lines.push(`Message: ${r.message}`);
+      lines.push(`Next retry in: ${r.next}ms`);
+    } else {
+      lines.push("");
+      lines.push("The agent is idle and ready for a new prompt.");
+    }
+
+    return ok(lines.join("\n"));
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return err(`Failed to get session status from "${nodeName}": ${msg}`);
+  }
+}
+
 // ── Dispatcher ────────────────────────────────────────────────────────────────
 
 export async function dispatchTool(
@@ -780,6 +916,8 @@ export async function dispatchTool(
       return handleListModels(ctx, args);
     case "fleet_interrupt_session":
       return handleInterruptSession(ctx, args);
+    case "fleet_get_session_status":
+      return handleGetSessionStatus(ctx, args);
     default:
       return err(`Unknown tool: ${toolName}`);
   }

@@ -256,12 +256,19 @@ export class OpenCodeNode {
   }
 
   /**
-   * Send an abort signal to a running session.
-   * Returns true if the session acknowledged the abort, false if it was not running.
+   * Send an abort/interrupt signal to a running session.
+   * Returns true if the interrupt was acknowledged, false otherwise.
    * This is fire-and-forget — it does NOT wait for the session to become idle.
+   *
+   * Uses POST /api/session/:id/interrupt (the correct opencode endpoint).
    */
   async abortSession(sessionId: string): Promise<boolean> {
-    return this.request<boolean>("POST", `/session/${sessionId}/abort`);
+    try {
+      await this.request<unknown>("POST", `/api/session/${sessionId}/interrupt`);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   // ── Messaging ───────────────────────────────────────────────────────────────
@@ -413,11 +420,19 @@ export class OpenCodeNode {
 
   /**
    * Extract the last assistant text reply from a message list.
-   * Returns an empty string if no assistant message is found.
+   *
+   * If the most recent assistant message has no TextParts yet (the agent is
+   * mid-step doing pure tool calls), falls back to a human-readable summary
+   * of the tool activity so the master can see the agent is busy rather than
+   * receiving a misleading empty string.
+   *
+   * Returns an empty string only if there are no assistant messages at all.
    */
   extractLastReply(messages: MessageWithParts[]): string {
-    // Messages are returned newest-first from the API
-    for (const mwp of messages) {
+    // Messages are returned in ascending order (oldest first, newest last).
+    // Scan from the end to find the most recent assistant message.
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const mwp = messages[i];
       if (mwp.info.role !== "assistant") continue;
 
       const text = mwp.parts
@@ -426,8 +441,104 @@ export class OpenCodeNode {
         .join("");
 
       if (text) return text;
+
+      // No text yet — the agent is likely mid-step doing tool calls.
+      // Build a summary from ToolParts so the caller knows work is in progress.
+      const toolParts = mwp.parts.filter((p): p is ToolPart => p.type === "tool");
+      if (toolParts.length > 0) {
+        const lines = ["[Agent is busy — no text reply yet. Tool activity in progress:]"];
+        for (const tp of toolParts) {
+          const status = tp.state.status === "completed" ? "✓"
+            : tp.state.status === "error" ? "✗"
+            : tp.state.status === "running" ? "⟳"
+            : "…";
+          let inputSummary = "";
+          if (tp.tool === "bash" && typeof tp.state.input?.["command"] === "string") {
+            inputSummary = tp.state.input["command"] as string;
+          } else if (tp.state.input) {
+            const firstVal = Object.values(tp.state.input).find((v) => typeof v === "string");
+            inputSummary = firstVal != null ? String(firstVal) : "";
+          }
+          lines.push(`  [tool:${tp.tool}] ${status} ${inputSummary}`.trimEnd());
+        }
+        return lines.join("\n");
+      }
+
+      // Assistant message exists but has neither text nor tool parts yet.
+      return "[Agent started processing — no output yet]";
     }
     return "";
+  }
+
+  /**
+   * Query the current execution status of a session.
+   *
+   * Uses GET /session/active — the authoritative opencode endpoint that
+   * returns a map of { [sessionID]: { type: "running" } } for all sessions
+   * currently executing an agent loop. A session is present → busy;
+   * absent → idle.
+   *
+   * This is O(1) and works correctly even for brand-new sessions that
+   * haven't emitted any messages yet (the old message-scan approach would
+   * incorrectly report them as idle).
+   *
+   * Falls back to the message-scan heuristic if the /session/active
+   * endpoint returns an unexpected shape (forward-compatibility).
+   *
+   * @throws NodeError if the HTTP request fails.
+   */
+  async getSessionStatus(sessionId: string): Promise<SessionStatus> {
+    const response = await this.request<{ data: Record<string, { type: string }> }>(
+      "GET",
+      "/api/session/active"
+    );
+
+    // /api/session/active returns { data: { [sessionID]: { type: "running" } } }
+    const active = response.data ?? (response as unknown as Record<string, { type: string }>);
+
+    // If the session appears in the active map, it is running.
+    if (Object.prototype.hasOwnProperty.call(active, sessionId)) {
+      return { type: "busy" };
+    }
+
+    // Not in the active map → idle.
+    return { type: "idle" };
+  }
+
+  /**
+   * Fallback: infer session status by scanning message history for a
+   * step-finish part after the last user message. Used as a degraded
+   * alternative when /session/active is unavailable.
+   *
+   * @internal
+   */
+  async getSessionStatusFallback(sessionId: string): Promise<SessionStatus> {
+    const messages = await this.request<MessageWithParts[]>(
+      "GET",
+      `/session/${sessionId}/message`
+    );
+
+    if (messages.length === 0) {
+      return { type: "idle" };
+    }
+
+    let lastUserIdx = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].info.role === "user") {
+        lastUserIdx = i;
+        break;
+      }
+    }
+
+    if (lastUserIdx === -1) {
+      return { type: "idle" };
+    }
+
+    const hasStepFinish = messages
+      .slice(lastUserIdx + 1)
+      .some((m) => m.parts.some((p) => p.type === "step-finish"));
+
+    return { type: hasStepFinish ? "idle" : "busy" };
   }
 }
 
