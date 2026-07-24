@@ -150,6 +150,7 @@ The tool returns structured status so you do not need to infer intent from raw t
 
 | Situation | Tool to use |
 |---|---|
+| Understand what a node can do before dispatching | `fleet_describe_node` |
 | Check if slave finished | `fleet_get_session_status` |
 | See what slave did / is doing | `fleet_get_session_messages` |
 | Stop a running task (keep session) | `fleet_interrupt_session` |
