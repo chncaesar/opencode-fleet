@@ -15,6 +15,7 @@
  *   fleet_switch_session     — switch to an existing session
  *   fleet_list_models        — list available models on a node
  *   fleet_interrupt_session  — send abort signal to a running session
+ *   fleet_describe_node      — query a node's permission policy and capabilities
  */
 
 import { OpenCodeNode } from "./node.js";
@@ -320,6 +321,35 @@ export const TOOL_DEFINITIONS = [
           type: "string",
           description:
             "Optional session ID to check. If omitted, uses the currently bound session.",
+        },
+      },
+      required: ["node"],
+    },
+  },
+  {
+    name: "fleet_describe_node",
+    description:
+      "Get the permission policy and capability summary for a remote OpenCode node. " +
+      "Sends a one-shot diagnostic prompt to the node (creates a temporary session, " +
+      "runs `opencode debug config`, then deletes the session immediately). " +
+      "The node's existing session binding is NOT affected — this tool is safe to call " +
+      "at any time, including while a session is active. " +
+      "Returns a human-readable summary of what the node is allowed to do " +
+      "(bash commands, file writes, and any other permission-constrained tools). " +
+      "Call this before dispatching work to understand whether the node can handle the task " +
+      "without hitting an approval block or unexpected denial.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        node: {
+          type: "string",
+          description: "Name of the target node.",
+        },
+        cwd: {
+          type: "string",
+          description:
+            "Working directory to use when creating a new session on this node. " +
+            "Defaults to \"/\" if omitted.",
         },
       },
       required: ["node"],
@@ -904,7 +934,306 @@ export async function handleGetSessionStatus(
   }
 }
 
-// ── Dispatcher ────────────────────────────────────────────────────────────────
+// fleet_describe_node ──────────────────────────────────────────────────────────
+
+/**
+ * Permission verdict values in opencode's permission config.
+ */
+type PermissionVerdict = "allow" | "deny" | "ask";
+
+/**
+ * Permission rules are stored as a nested map:
+ *   { [tool]: { [pattern]: "allow" | "deny" | "ask" } }
+ *
+ * This matches the opencode config schema's `permission` field.
+ */
+type PermissionRules = Record<string, Record<string, PermissionVerdict>>;
+
+/**
+ * Find the end index of the first complete JSON object starting at `startIdx`
+ * by counting brace nesting depth.  Returns -1 if no complete object is found.
+ *
+ * This is safer than `lastIndexOf("}")` because it correctly handles:
+ *   - JSON objects followed by arbitrary text
+ *   - `}` characters inside string values
+ *   - Deeply nested objects
+ *
+ * Note: does not handle `}` inside string values that contain `{` — for our
+ * purposes (parsing `opencode debug config` output) this is acceptable.
+ */
+function findJsonEnd(text: string, startIdx: number): number {
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = startIdx; i < text.length; i++) {
+    const ch = text[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escape = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (ch === "{") {
+      depth++;
+    } else if (ch === "}") {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Extract and format the `permission` section from the JSON blob that
+ * `opencode debug config` returns.  Falls back gracefully on any shape.
+ */
+function formatPermissions(raw: unknown): string {
+  if (
+    typeof raw !== "object" ||
+    raw === null ||
+    !("permission" in raw) ||
+    typeof (raw as Record<string, unknown>)["permission"] !== "object"
+  ) {
+    return "(no permission section found — node may be running without a permission policy)";
+  }
+
+  const perm = (raw as Record<string, unknown>)["permission"] as PermissionRules;
+  const tools = Object.keys(perm);
+  if (tools.length === 0) {
+    // Empty permission section.  Behaviour depends on --auto flag:
+    //   --auto  → all operations auto-approved (no approval prompts)
+    //   default → all operations default to "ask" (approval prompts)
+    return "(permission section is empty — behaviour depends on --auto flag: " +
+      "with --auto all ops are auto-approved; without it all ops default to \"ask\")";
+  }
+
+  // Compute max pattern length for column alignment
+  let maxPatternLen = 0;
+  for (const tool of tools) {
+    const patterns = perm[tool];
+    if (typeof patterns !== "object" || patterns === null) continue;
+    for (const p of Object.keys(patterns)) {
+      if (p.length > maxPatternLen) maxPatternLen = p.length;
+    }
+  }
+  const colWidth = Math.max(maxPatternLen + 2, 20);
+
+  const lines: string[] = [];
+  for (const tool of tools.sort()) {
+    const patterns = perm[tool];
+    if (typeof patterns !== "object" || patterns === null) continue;
+    lines.push(`${tool}:`);
+    for (const [pattern, verdict] of Object.entries(patterns).sort()) {
+      lines.push(`  ${pattern.padEnd(colWidth)} → ${verdict}`);
+    }
+  }
+
+  return lines.join("\n");
+}
+
+/**
+ * Summarise the permission rules for a single tool into a single line.
+ * Returns null if there are no rules for that tool.
+ */
+function summariseTool(rules: Record<string, PermissionVerdict> | undefined, toolName: string): string | null {
+  if (!rules) return null;
+
+  const entries = Object.entries(rules);
+  if (entries.length === 0) return null;
+
+  const allowAll = entries.some(([p, v]) => p === "*" && v === "allow");
+  const denyAll  = entries.some(([p, v]) => p === "*" && v === "deny");
+  const askAll   = entries.some(([p, v]) => p === "*" && v === "ask");
+
+  const allowCount = entries.filter(([, v]) => v === "allow").length;
+  const denyCount  = entries.filter(([, v]) => v === "deny").length;
+  const askCount   = entries.filter(([, v]) => v === "ask").length;
+
+  if (allowAll) {
+    return `${toolName}: ALL patterns auto-allowed — no approval prompts`;
+  }
+  if (denyAll) {
+    return `${toolName}: ALL patterns denied — operations will fail immediately`;
+  }
+  if (askAll) {
+    const extras: string[] = [];
+    if (allowCount > 1) extras.push(`${allowCount - 0} explicit allow rule(s)`);
+    if (denyCount > 0)  extras.push(`${denyCount} deny rule(s)`);
+    return `${toolName}: default=ask (APPROVAL REQUIRED for unlisted patterns)` +
+      (extras.length > 0 ? `; ${extras.join(", ")}` : "");
+  }
+
+  const parts: string[] = [];
+  if (allowCount > 0) parts.push(`${allowCount} allow`);
+  if (denyCount > 0)  parts.push(`${denyCount} deny`);
+  if (askCount > 0)   parts.push(`${askCount} ask`);
+  return `${toolName}: ${parts.join(", ")} rule(s); unlisted patterns default to "ask" (may block)`;
+}
+
+/**
+ * Derive a short capability summary from a permission map.
+ * Flags dangerous combinations (e.g. bash * allow) for the master agent.
+ */
+function capabilitySummary(raw: unknown): string {
+  if (
+    typeof raw !== "object" ||
+    raw === null ||
+    !("permission" in raw) ||
+    typeof (raw as Record<string, unknown>)["permission"] !== "object"
+  ) {
+    return "Unknown — no permission config found. Assume approval prompts may block execution.";
+  }
+
+  const perm = (raw as Record<string, unknown>)["permission"] as PermissionRules;
+  const notes: string[] = [];
+
+  // bash
+  const bashSummary = summariseTool(perm["bash"], "bash");
+  if (bashSummary) {
+    notes.push(bashSummary);
+  } else {
+    notes.push('bash: no rules configured — defaults to "ask" (approval prompts WILL block)');
+  }
+
+  // write / edit — always report, even if neither has rules
+  const writeSummary = summariseTool(perm["write"], "write");
+  const editSummary  = summariseTool(perm["edit"], "edit");
+  if (writeSummary) notes.push(writeSummary);
+  if (editSummary)  notes.push(editSummary);
+  if (!writeSummary && !editSummary) {
+    notes.push('write/edit: no rules configured — defaults to "ask" (approval prompts may block)');
+  }
+
+  // Report any other configured tools so master has the full picture
+  const knownTools = new Set(["bash", "write", "edit"]);
+  for (const tool of Object.keys(perm).sort()) {
+    if (knownTools.has(tool)) continue;
+    const summary = summariseTool(perm[tool], tool);
+    if (summary) notes.push(summary);
+  }
+
+  return notes.join("\n");
+}
+
+export async function handleDescribeNode(
+  ctx: FleetContext,
+  args: Record<string, unknown>
+): Promise<ToolResult> {
+  const nodeName = String(args["node"] ?? "");
+  if (!nodeName) return err("Missing required argument: node");
+
+  const node = ctx.nodes.get(nodeName);
+  if (!node) {
+    return err(
+      `Unknown node "${nodeName}". Available: ${Array.from(ctx.nodes.keys()).join(", ")}`
+    );
+  }
+
+  // 1. Health check first — avoids creating a session on an offline node
+  const alive = await node.ping();
+  if (!alive) {
+    return err(
+      `Node "${nodeName}" is offline or unreachable (${node.baseUrl}). ` +
+        `Cannot query permission config.`
+    );
+  }
+
+  // 2. Create a one-shot diagnostic session.
+  //    We deliberately bypass SessionManager.send() to avoid two side-effects:
+  //      (a) if a session already exists, send() would append the diagnostic
+  //          prompt to its history, polluting the working context.
+  //      (b) if no session exists, send() would create one and bind it as the
+  //          "current" session, hijacking future fleet_send_message calls.
+  //    Instead: create → send → waitForIdle → getMessages → delete.
+  //    The session never touches SessionManager's cache.
+  const cwd = args["cwd"] ? String(args["cwd"]) : "/";
+  const prompt =
+    "Run the shell command `opencode debug config` and reply with ONLY the raw JSON " +
+    "output it produces — no explanation, no markdown code fence, no extra text. " +
+    "The output must start with `{` and end with `}`.";
+
+  let reply: string;
+  let diagSessionId: string | undefined;
+  try {
+    const diagSession = await node.createSession({ cwd, agent: "build" });
+    diagSessionId = diagSession.id;
+
+    await node.sendPromptAsync(diagSessionId, prompt);
+
+    // Wait for the slave to finish; use 60 s max for this lightweight task.
+    const diagTimeoutMs = Math.min(ctx.config.timeoutSeconds * 1000, 60_000);
+    let timedOut = false;
+    try {
+      await node.waitForIdle(diagSessionId, diagTimeoutMs);
+    } catch {
+      timedOut = true;
+    }
+
+    if (timedOut) {
+      // Clean up the dangling diagnostic session before returning.
+      try { await node.deleteSession(diagSessionId); } catch { /* best effort */ }
+      return err(
+        `Node "${nodeName}" did not respond within ${diagTimeoutMs / 1000}s while running ` +
+          `"opencode debug config". This is unusual — the diagnostic prompt is lightweight.\n\n` +
+          `Recommended actions:\n` +
+          `  1. Use fleet_node_health to confirm the node is still reachable.\n` +
+          `  2. Use fleet_list_sessions to inspect sessions on the node.\n` +
+          `  3. If the node is stuck, consider escalating to a human operator — ` +
+          `a node that cannot respond to a simple diagnostic prompt may need manual inspection.`
+      );
+    }
+
+    const messages = await node.getMessages(diagSessionId, 5);
+    reply = node.extractLastReply(messages);
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return err(`Failed to query node "${nodeName}": ${msg}`);
+  } finally {
+    // Always clean up the diagnostic session so it doesn't litter the node.
+    if (diagSessionId) {
+      try { await node.deleteSession(diagSessionId); } catch { /* best effort */ }
+    }
+  }
+
+  // 3. Extract JSON from the reply using brace-depth counting.
+  //    The slave may wrap output in markdown fences despite being asked not to;
+  //    we find the first `{` and scan forward to the matching `}`.
+  let configJson: unknown = null;
+  const jsonStart = reply.indexOf("{");
+  if (jsonStart !== -1) {
+    const jsonEnd = findJsonEnd(reply, jsonStart);
+    if (jsonEnd !== -1) {
+      try {
+        configJson = JSON.parse(reply.slice(jsonStart, jsonEnd + 1));
+      } catch {
+        // Leave configJson null — will fall through to the raw-reply path
+      }
+    }
+  }
+
+  const lines: string[] = [`Node: ${nodeName}`, `URL:  ${node.baseUrl}`, ""];
+
+  if (configJson !== null) {
+    lines.push("── Permission Policy ────────────────────────────────────");
+    lines.push(formatPermissions(configJson));
+    lines.push("");
+    lines.push("── Capability Summary ───────────────────────────────────");
+    lines.push(capabilitySummary(configJson));
+  } else {
+    lines.push("── Raw config output (could not parse JSON) ─────────────");
+    lines.push(reply.slice(0, 2000));
+    if (reply.length > 2000) lines.push("…(truncated)");
+  }
+
+  return ok(lines.join("\n"));
+}
 
 export async function dispatchTool(
   ctx: FleetContext,
@@ -934,6 +1263,8 @@ export async function dispatchTool(
       return handleInterruptSession(ctx, args);
     case "fleet_get_session_status":
       return handleGetSessionStatus(ctx, args);
+    case "fleet_describe_node":
+      return handleDescribeNode(ctx, args);
     default:
       return err(`Unknown tool: ${toolName}`);
   }
