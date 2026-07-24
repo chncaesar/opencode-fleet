@@ -569,6 +569,9 @@ export class OpenCodeNode {
    * @param sessionId         Target session ID.
    * @param prompt            The prompt text.
    * @param reasoningEffort   Optional reasoning effort hint ("low" | "medium" | "high").
+   *                          Passed as the `variant` field in the v1 prompt body, which maps
+   *                          to model.variants[variant] → { reasoningEffort } at the server.
+   *                          Silently ignored if the target model has no matching variant key.
    */
   async sendPromptAsync(
     sessionId: string,
@@ -578,7 +581,10 @@ export class OpenCodeNode {
     const body: Record<string, unknown> = {
       parts: [{ type: "text", text: prompt }],
     };
-    if (reasoningEffort) body["reasoning_effort"] = reasoningEffort;
+    // v1 API uses `variant` (not `reasoning_effort`) to select a named model config preset.
+    // The server looks up model.variants[variant] and merges the result into LLM options,
+    // which is where reasoningEffort ultimately reaches the provider SDK.
+    if (reasoningEffort) body["variant"] = reasoningEffort;
     await this.request<unknown>("POST", `/session/${sessionId}/prompt_async`, body);
     // Optimistic update — mirrors desktop submit.ts:60 which immediately sets
     // session_status to busy before the SSE event arrives, eliminating the

@@ -16,7 +16,8 @@ opencode runs as a local HTTP server (default port 4096). All UI frontends (TUI,
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/api/health` | Liveness check → `{ healthy: true }` |
+| GET | `/api/health` | Liveness check (Protocol/v2 layer) → `{ healthy: true }` |
+| GET | `/global/health` | Liveness check (RootHttpApi/v1 layer) → `{ healthy: true, version: string }` — also carries `version`, used by fleet `ping()` |
 
 ### Sessions
 
@@ -266,6 +267,18 @@ Current approach: open SSE stream on `/api/session/:id/event`, parse durable eve
 
 Alternative: `POST /api/session/:id/wait` — server-side long-poll, blocks until agent is idle. Simpler, no SSE parsing, but may not carry partial output. Current SSE approach is acceptable; the main improvement is handling `TimeoutError` correctly (already done).
 
-### `/api/session/:id/message` — oldest-first with limit
+### `/api/session/:id/message` — v1 vs v2 semantics differ
 
-The API returns messages in **chronological order (oldest first)**. When `?limit=N` is given, it returns the **oldest** N messages. There is no "latest N" endpoint. To get recent messages in a long session, fetch all (no limit) and take the tail.
+**v1 endpoint** — `GET /session/:sessionID/message?limit=N` (no `/api` prefix)
+
+Implemented in `packages/opencode/src/session/message-v2.ts` (`page()`): executes
+`ORDER BY time_created DESC, id DESC LIMIT N` then reverses the slice before returning.
+Result: the **newest N messages in chronological (ascending) order** — index 0 is the
+oldest of the N, last index is the newest. This is what fleet currently uses.
+
+**v2 endpoint** — `GET /api/session/:sessionID/message?limit=N&order=asc|desc`
+
+Supports `limit`, `order` (`asc` / `desc`, default `desc`), and `cursor` for pagination.
+`order=desc` returns newest-first; `order=asc` returns oldest-first.
+Response shape: `{ data: SessionMessage.Message[], cursor: { previous?, next? } }` — a
+different schema from the v1 `MessageWithParts[]` array, requiring separate parsing logic.

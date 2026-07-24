@@ -27,6 +27,7 @@ import type {
   ToolPart,
   StepFinishPart,
   FilePart,
+  SessionStatus,
 } from "./node.js";
 
 // ── Context ───────────────────────────────────────────────────────────────────
@@ -279,13 +280,22 @@ export const TOOL_DEFINITIONS = [
       "Fire-and-forget: returns immediately after the signal is sent. " +
       "Does NOT wait for the session to become idle, does NOT reset the session binding, " +
       "and does NOT delete the session. " +
-      "Use this when you want to stop a long-running task early (like Ctrl+C).",
+      "Use this when you want to stop a long-running task early (like Ctrl+C). " +
+      "If session_id is omitted, uses the node's active session binding. " +
+      "Pass session_id explicitly to interrupt a specific session (e.g. after a master restart " +
+      "when the in-memory binding cache is lost). Use fleet_list_sessions to find session IDs.",
     inputSchema: {
       type: "object",
       properties: {
         node: {
           type: "string",
           description: "Name of the target node.",
+        },
+        session_id: {
+          type: "string",
+          description:
+            "Optional explicit session ID to interrupt. If omitted, uses the node's active " +
+            "session binding. Use fleet_list_sessions to find session IDs.",
         },
       },
       required: ["node"],
@@ -325,7 +335,7 @@ type ToolResult = {
 };
 
 function ok(text: string): ToolResult {
-  return { content: [{ type: "text", text }] };
+  return { content: [{ type: "text", text }], isError: false };
 }
 
 function err(text: string): ToolResult {
@@ -812,10 +822,16 @@ export async function handleInterruptSession(
     );
   }
 
-  const sessionId = ctx.sessions.getSessionId(nodeName);
+  // Accept an explicit session_id argument; fall back to the active binding.
+  // This allows interrupt to work after a master restart when the in-memory
+  // cache is lost — use fleet_list_sessions to find the session ID first.
+  const explicitId = args["session_id"] ? String(args["session_id"]) : undefined;
+  const sessionId = explicitId ?? ctx.sessions.getSessionId(nodeName);
   if (!sessionId) {
     return err(
-      `Node "${nodeName}" has no active session. Use fleet_send_message to start one first.`
+      `Node "${nodeName}" has no active session. ` +
+        `Use fleet_list_sessions to find an existing session ID, or ` +
+        `fleet_send_message to start a new one.`
     );
   }
 
@@ -872,7 +888,7 @@ export async function handleGetSessionStatus(
       lines.push("Use fleet_get_session_messages to see current progress.");
       lines.push("Use fleet_interrupt_session to stop it early if needed.");
     } else if (status.type === "retry") {
-      const r = status as { type: "retry"; attempt: number; message: string; next: number };
+      const r = status as Extract<SessionStatus, { type: "retry" }>;
       lines.push(`Attempt: ${r.attempt}`);
       lines.push(`Message: ${r.message}`);
       lines.push(`Next retry in: ${r.next}ms`);

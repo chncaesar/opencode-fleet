@@ -121,50 +121,30 @@ Returns `MessageWithParts[]` — each element is `{ info: Message, parts: Part[]
 
 ## Fleet operation protocol for master agents
 
-This section is directed at AI agents (Claude, OpenCode) acting as the **master** in a fleet session. Following this protocol prevents the most common failure mode: blindly resetting a slave session that is still running.
+This section is directed at AI agents (Claude, OpenCode) acting as the **master** in a fleet session.
 
 ### Mental model
 
 A `fleet_send_message` call blocks until the slave becomes idle **or** a timeout fires. A **timeout is not a failure** — it means the slave is still working and simply did not finish within the allotted window. The slave session is still alive and should not be discarded.
 
-### Decision tree after fleet_send_message returns
+The tool itself encodes this guidance in its return value. When `fleet_send_message` returns `status: "timeout_still_busy"`, follow the `hint` field — it will say to wait and check status, not to reset.
 
-```
-fleet_send_message returns
-         │
-         ├── Status: completed ──────────────────► normal flow, use reply
-         │
-         ├── Status: completed with error ────────► inspect reply, decide to retry or fix
-         │
-         └── Status: TIMEOUT (still running)
-                  │
-                  ▼
-          1. fleet_get_session_status          ← check if still busy
-                  │
-                  ├── idle  ─────────────────► fetch messages, proceed normally
-                  │
-                  └── busy  ─────────────────► 2. fleet_get_session_messages (view progress)
-                                                       │
-                                                       ├── looks fine, just slow
-                                                       │        └─► wait, then retry fleet_send_message
-                                                       │
-                                                       ├── stuck / wrong path
-                                                       │        └─► fleet_interrupt_session → wait → retry
-                                                       │
-                                                       └── ONLY if completely broken
-                                                                └─► fleet_interrupt_session
-                                                                    → confirm idle via fleet_get_session_status
-                                                                    → fleet_reset_session (LAST RESORT)
-```
+### Structured return values from fleet_send_message
+
+The tool returns structured status so you do not need to infer intent from raw text:
+
+| `status` field | Meaning | What to do |
+|---|---|---|
+| `completed` | Slave finished, reply is ready | Use the reply |
+| `completed` + empty `reply` | Agent was mid-step (tool call in progress) | Check `fleet_get_session_messages` for context |
+| `timeout_still_busy` | Slave is still working, timeout elapsed | Wait, then call `fleet_get_session_status` — do NOT reset |
+| `queued` | Slave was busy, message has been queued | Wait for current task to finish before sending more |
+| `error` | Slave returned an error | Inspect reply, decide to retry or fix |
 
 ### Rules
 
-1. **Never reset on timeout.** A timeout means the slave is busy, not broken.
-2. **Check before resetting.** Always call `fleet_get_session_status` before `fleet_reset_session`.
-3. **Interrupt before reset.** If you must stop a busy session, call `fleet_interrupt_session` first and confirm idle, then reset.
-4. **Empty reply ≠ failure.** If the reply is empty or shows tool activity, the agent was mid-step. Check messages for context.
-5. **Queued messages accumulate.** If you send multiple prompts while the slave is busy, they queue up. Use `fleet_get_session_messages` to see what the slave received before sending more.
-6. **Escalate to human** if the slave is stuck and you cannot determine why after two attempts. Do not loop indefinitely.
+1. **Timeout means busy, not broken.** When `status` is `timeout_still_busy`, the slave is still working. Wait.
+2. **Escalate to human** if the slave is stuck and you cannot determine why after two attempts. Do not loop indefinitely. The tool will set `escalate_hint: true` when this threshold is reached.
 
 ### Tool quick-reference
 
@@ -173,7 +153,8 @@ fleet_send_message returns
 | Check if slave finished | `fleet_get_session_status` |
 | See what slave did / is doing | `fleet_get_session_messages` |
 | Stop a running task (keep session) | `fleet_interrupt_session` |
-| Discard session and start fresh | `fleet_reset_session` (last resort) |
+| Stop a task after master restart (cache lost) | `fleet_list_sessions` to find session ID, then `fleet_interrupt_session` with `session_id` |
+| Discard session and start fresh | `fleet_reset_session` (last resort, only when session is idle) |
 
 ## Implementation notes
 
