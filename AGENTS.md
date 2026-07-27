@@ -1,7 +1,5 @@
 # AGENTS.md — opencode-fleet
-
-Instructions for AI agents (OpenCode, Claude, etc.) operating in this repository.
-
+## Implementation notes
 ## What this project is
 
 `opencode-fleet` is an MCP server written in TypeScript. It allows a master OpenCode instance to coordinate multiple remote OpenCode nodes by exposing `fleet_*` MCP tools. The master agent calls these tools; the fleet server translates them into OpenCode REST API calls on each remote node.
@@ -163,6 +161,30 @@ fleet_get_session_messages(node_B)
 | Stop a running task (keep session) | `fleet_interrupt_session` |
 | Stop a task after master restart (cache lost) | `fleet_list_sessions` to find session ID, then `fleet_interrupt_session` with `session_id` |
 | Discard session and start fresh | `fleet_reset_session` (last resort, only when session is idle) |
+
+### Slave safety and capability awareness
+
+#### Why slaves can deadlock without `--auto`
+
+When opencode runs in server mode (no terminal), any `ask`-level permission triggers an approval prompt that blocks forever — the session stays `busy` indefinitely, new messages queue up, and the fleet appears hung. Slaves **must** be started with `--auto` so that `deny` rules return errors immediately instead of waiting for human input.
+
+#### `fleet_node_health` — capability-aware health check
+
+`fleet_node_health` (with `include_capabilities: true`, the default) fetches the slave's runtime permission policy by dispatching a one-shot diagnostic session (`opencode debug config`). This gives the master the actual enforced rules before dispatching work.
+
+**Why `opencode debug config` instead of reading a config file directly:**
+
+`opencode debug config` returns the slave's **fully-merged runtime config** — all config layers resolved in order (global → project → managed). The managed config layer (highest priority, user-cannot-override) is already folded in. Reading individual files would miss this merge and could show rules that are actually overridden. Fleet never needs SSH credentials to read the slave's filesystem.
+
+**Why capability fetch is built into `fleet_node_health` rather than a separate tool:**
+
+The master naturally calls `fleet_node_health` before first use to confirm the node is alive. Embedding capability fetch there aligns the timing with when the master needs it, with no extra constraint needed. A separate `fleet_describe_node` would require the master to remember to call it first — which means relying on AGENTS.md discipline rather than tool design.
+
+**Implementation details (for developers):**
+- One-shot session: `createSession` → `sendPromptAsync` → `waitForIdle` → `getMessages` → `deleteSession`. Never touches the node's active session binding.
+- JSON extraction uses bracket-depth counting (`findJsonEnd`) — immune to stray `}` inside string values.
+- Capability summary covers bash / write / edit and any other configured tools, reporting five cases: allow-all, deny-all, ask-all, mixed rules, no rules configured.
+- On timeout: returns structured three-step escalation guidance prompting human inspection.
 
 ## Implementation notes
 
