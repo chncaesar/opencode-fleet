@@ -52,8 +52,8 @@ opencode 使用 `remeda.mergeDeep` 对所有配置层做**深合并**（`package
 1. Remote config（`.well-known/opencode`）
 2. Global config（`~/.config/opencode/opencode.jsonc`）
 3. `OPENCODE_CONFIG` 环境变量
-4. Project config（cwd 向上查找到 git root 的 `opencode.jsonc`）
-5. `.opencode/` 目录配置
+4. Project config（从 cwd 向上到 worktree root，查找每层的 `opencode.jsonc` 或 `opencode.json`，越近 cwd 优先级越高）
+5. `.opencode/` 目录配置（从 cwd 向上到 worktree root 路径上**所有层**的 `.opencode/` 目录，以及 `$HOME/.opencode/`；`.opencode` 是目录名，加载其中的 `opencode.json` 和 `opencode.jsonc`）
 6. `OPENCODE_CONFIG_CONTENT` 环境变量
 7. **Managed config**（Linux: `/etc/opencode/`，macOS: `/Library/Application Support/opencode/`，Windows: `%ProgramData%\opencode`）← 最高优先级，用户不可覆盖
 8. `OPENCODE_PERMISSION` 环境变量（仅覆盖 permission 字段，适合 CI/CD）
@@ -137,18 +137,32 @@ master → fleet MCP → slave opencode
 ```
 managed config（单一真相来源）
        ↓
-fleet MCP 读取并暴露给 master（fleet_describe_node）
+fleet MCP 读取并暴露给 master（fleet_node_health with include_capabilities=true）
        ↓
 master 在生成命令前知道边界
        ↓
 slave 执行时 deny 规则硬拦截
 ```
 
-### 新增工具：fleet_describe_node
+### 新增工具：fleet_node_health（含能力描述）
 
-fleet MCP 新增 `fleet_describe_node` 工具，在 master 首次使用节点前调用，返回节点能力的自然语言描述。master 建立正确心智模型后，生成越界命令的概率大幅降低。
+`fleet_describe_node` 已合并进 `fleet_node_health`，不再作为独立工具存在。
+
+`fleet_node_health` 新增 `include_capabilities` 参数（默认 `true`）：ping 通节点后自动发一次一次性诊断 session（`opencode debug config`），返回权限策略表格 + 能力摘要。`include_capabilities: false` 时退化为原来的轻量 ping。
+
+**为什么合并而不是独立工具**：master 在首次使用节点前自然会调用 `fleet_node_health` 确认节点存活。把能力描述合并进去，调用时机天然对齐，不需要任何额外约束（文档告诫或代码强制）就能保证 master 在开始工作前看到能力边界。独立的 `fleet_describe_node` 则依赖 AI 自律或 AGENTS.md 约束，与"策略内化进工具"的设计原则矛盾。
 
 **已实现方案**：向 slave 发一条一次性 prompt（`opencode debug config`），fleet MCP 解析返回的 JSON，提取 `permission` 字段，格式化为 Permission Policy 表格 + Capability Summary。
+
+**为什么读 `opencode debug config` 而不是直接读配置文件**：
+
+`opencode debug config` 返回的是 slave opencode 进程**运行时已合并完所有层**的最终配置，不是某个特定文件的内容。这意味着：
+
+- managed config（第 7 层）的 deny 规则已经覆盖了所有前面层的冲突 key
+- 读到的就是 slave 实际执行时会生效的规则，和 slave 看到的完全一致
+- 不需要知道 managed config 在哪个路径，也不需要额外 SSH 凭证去读文件
+
+这也解释了"managed config 作为不可覆盖的全局 deny 层"的含义：用户的项目配置（第 4/5 层）如果写了 `"rm -rf *": "allow"`，而 managed config（第 7 层）写了 `"rm -rf *": "deny"`，合并后该 key 的值是 `deny`，用户的 `allow` 被盖掉。`fleet_node_health` 读到的合并结果会直接反映这个最终状态，master 看到的就是真实生效的边界。
 
 实现细节：
 - 使用一次性 session（`createSession` → `sendPromptAsync` → `waitForIdle` → `getMessages` → `deleteSession`），节点已有的 session binding 完全不受影响，任何时候调用都安全
@@ -205,7 +219,7 @@ master 下发命令
 1. slave 连续 2 次返回同类错误且 master 无法自动修正（如 permission deny 但无合法替代路径）
 2. slave 返回边界错误且 master 无法在允许路径内完成等价操作
 
-> 注：触发条件 1 目前依赖 master AI 的判断，没有 `policy_violation` 结构化信号辅助（原因见上节）。`escalate_hint: true` 字段在 fleet_describe_node 超时路径中已实现（文字层面），fleet_send_message 的结构化状态字段见 [fleet-send-message-refactor.md](./fleet-send-message-refactor.md)。
+> 注：触发条件 1 目前依赖 master AI 的判断，没有 `policy_violation` 结构化信号辅助（原因见上节）。`escalate_hint` 提示在 `fleet_node_health` 能力查询超时路径中已实现（文字层面），fleet_send_message 的结构化状态字段见 [fleet-send-message-refactor.md](./fleet-send-message-refactor.md)。
 
 ### AGENTS.md 内容迁移分析
 

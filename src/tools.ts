@@ -9,13 +9,13 @@
  *   fleet_send_message       — send a prompt to a node and wait for reply
  *   fleet_get_session_messages — fetch message history from a node's session
  *   fleet_reset_session      — discard cached session for a node
- *   fleet_node_health        — check health of a specific node
+ *   fleet_node_health        — check health + capability summary of a node (include_capabilities defaults to true)
  *   fleet_list_sessions      — list all sessions on a node
  *   fleet_create_session     — create a new session and bind to it
  *   fleet_switch_session     — switch to an existing session
  *   fleet_list_models        — list available models on a node
  *   fleet_interrupt_session  — send abort signal to a running session
- *   fleet_describe_node      — query a node's permission policy and capabilities
+ *   fleet_get_session_status — check if a session is idle or busy
  */
 
 import { OpenCodeNode } from "./node.js";
@@ -170,13 +170,30 @@ export const TOOL_DEFINITIONS = [
     name: "fleet_node_health",
     description:
       "Check whether a specific remote OpenCode node is reachable and responding. " +
-      "Returns ok/error status with latency.",
+      "Returns ok/error status with latency. " +
+      "When include_capabilities is true (default), also fetches the node's permission " +
+      "policy and capability summary by running a one-shot diagnostic session " +
+      "(`opencode debug config`). This tells you what the node is allowed to do " +
+      "(bash commands, file writes, etc.) before you dispatch work to it. " +
+      "Call this before using a node for the first time.",
     inputSchema: {
       type: "object",
       properties: {
         node: {
           type: "string",
           description: "Name of the node to check.",
+        },
+        include_capabilities: {
+          type: "boolean",
+          description:
+            "Whether to also fetch the node's permission policy and capability summary. " +
+            "Defaults to true. Set to false for a fast lightweight ping only.",
+        },
+        cwd: {
+          type: "string",
+          description:
+            "Working directory to use when creating the diagnostic session. " +
+            "Only relevant when include_capabilities is true. Defaults to \"/\".",
         },
       },
       required: ["node"],
@@ -321,35 +338,6 @@ export const TOOL_DEFINITIONS = [
           type: "string",
           description:
             "Optional session ID to check. If omitted, uses the currently bound session.",
-        },
-      },
-      required: ["node"],
-    },
-  },
-  {
-    name: "fleet_describe_node",
-    description:
-      "Get the permission policy and capability summary for a remote OpenCode node. " +
-      "Sends a one-shot diagnostic prompt to the node (creates a temporary session, " +
-      "runs `opencode debug config`, then deletes the session immediately). " +
-      "The node's existing session binding is NOT affected — this tool is safe to call " +
-      "at any time, including while a session is active. " +
-      "Returns a human-readable summary of what the node is allowed to do " +
-      "(bash commands, file writes, and any other permission-constrained tools). " +
-      "Call this before dispatching work to understand whether the node can handle the task " +
-      "without hitting an approval block or unexpected denial.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        node: {
-          type: "string",
-          description: "Name of the target node.",
-        },
-        cwd: {
-          type: "string",
-          description:
-            "Working directory to use when creating a new session on this node. " +
-            "Defaults to \"/\" if omitted.",
         },
       },
       required: ["node"],
@@ -670,18 +658,105 @@ export async function handleNodeHealth(
   const healthy = await node.ping();
   const latencyMs = Date.now() - t0;
 
-  if (healthy) {
-    return ok(
-      `Node "${nodeName}" is online\n` +
+  if (!healthy) {
+    return err(
+      `Node "${nodeName}" is OFFLINE or unreachable\n` +
         `URL: ${node.baseUrl}\n` +
         `Latency: ${latencyMs}ms`
     );
   }
-  return err(
-    `Node "${nodeName}" is OFFLINE or unreachable\n` +
-      `URL: ${node.baseUrl}\n` +
-      `Latency: ${latencyMs}ms`
-  );
+
+  const headerLines = [
+    `Node "${nodeName}" is online`,
+    `URL: ${node.baseUrl}`,
+    `Latency: ${latencyMs}ms`,
+  ];
+
+  // include_capabilities defaults to true
+  const includeCapabilities = args["include_capabilities"] !== false;
+  if (!includeCapabilities) {
+    return ok(headerLines.join("\n"));
+  }
+
+  // Fetch permission policy via one-shot diagnostic session (same logic as
+  // handleDescribeNode, inlined here so fleet_node_health is self-contained).
+  const cwd = args["cwd"] ? String(args["cwd"]) : "/";
+  const prompt =
+    "Run the shell command `opencode debug config` and reply with ONLY the raw JSON " +
+    "output it produces — no explanation, no markdown code fence, no extra text. " +
+    "The output must start with `{` and end with `}`.";
+
+  let reply: string;
+  let diagSessionId: string | undefined;
+  try {
+    const diagSession = await node.createSession({ cwd, agent: "build" });
+    diagSessionId = diagSession.id;
+
+    await node.sendPromptAsync(diagSessionId, prompt);
+
+    const diagTimeoutMs = Math.min(ctx.config.timeoutSeconds * 1000, 60_000);
+    let timedOut = false;
+    try {
+      await node.waitForIdle(diagSessionId, diagTimeoutMs);
+    } catch {
+      timedOut = true;
+    }
+
+    if (timedOut) {
+      try { await node.deleteSession(diagSessionId); } catch { /* best effort */ }
+      diagSessionId = undefined;
+      return ok(
+        headerLines.join("\n") + "\n\n" +
+          `WARNING: Could not fetch capability summary — node did not respond within ` +
+          `${diagTimeoutMs / 1000}s while running "opencode debug config".\n` +
+          `The node is reachable but capability info is unavailable. ` +
+          `Escalate to a human operator if this persists.`,
+      );
+    }
+
+    const messages = await node.getMessages(diagSessionId, 5);
+    reply = node.extractLastReply(messages);
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return ok(
+      headerLines.join("\n") + "\n\n" +
+        `WARNING: Could not fetch capability summary: ${msg}`,
+    );
+  } finally {
+    if (diagSessionId) {
+      try { await node.deleteSession(diagSessionId); } catch { /* best effort */ }
+    }
+  }
+
+  // Parse JSON from the reply using brace-depth counting.
+  let configJson: unknown = null;
+  const jsonStart = reply.indexOf("{");
+  if (jsonStart !== -1) {
+    const jsonEnd = findJsonEnd(reply, jsonStart);
+    if (jsonEnd !== -1) {
+      try {
+        configJson = JSON.parse(reply.slice(jsonStart, jsonEnd + 1));
+      } catch {
+        // leave null — fall through to raw-reply path
+      }
+    }
+  }
+
+  const lines: string[] = [...headerLines, ""];
+
+  if (configJson !== null) {
+    lines.push("── Permission Policy ────────────────────────────────────");
+    lines.push(formatPermissions(configJson));
+    lines.push("");
+    lines.push("── Capability Summary ───────────────────────────────────");
+    lines.push(capabilitySummary(configJson));
+  } else {
+    lines.push("── Raw config output (could not parse JSON) ─────────────");
+    lines.push(reply.slice(0, 2000));
+    if (reply.length > 2000) lines.push("…(truncated)");
+  }
+
+  return ok(lines.join("\n"));
 }
 
 // fleet_list_sessions ──────────────────────────────────────────────────────────
@@ -934,7 +1009,7 @@ export async function handleGetSessionStatus(
   }
 }
 
-// fleet_describe_node ──────────────────────────────────────────────────────────
+// node capability helpers (used by fleet_node_health) ─────────────────────────
 
 /**
  * Permission verdict values in opencode's permission config.
@@ -1122,118 +1197,6 @@ function capabilitySummary(raw: unknown): string {
   return notes.join("\n");
 }
 
-export async function handleDescribeNode(
-  ctx: FleetContext,
-  args: Record<string, unknown>
-): Promise<ToolResult> {
-  const nodeName = String(args["node"] ?? "");
-  if (!nodeName) return err("Missing required argument: node");
-
-  const node = ctx.nodes.get(nodeName);
-  if (!node) {
-    return err(
-      `Unknown node "${nodeName}". Available: ${Array.from(ctx.nodes.keys()).join(", ")}`
-    );
-  }
-
-  // 1. Health check first — avoids creating a session on an offline node
-  const alive = await node.ping();
-  if (!alive) {
-    return err(
-      `Node "${nodeName}" is offline or unreachable (${node.baseUrl}). ` +
-        `Cannot query permission config.`
-    );
-  }
-
-  // 2. Create a one-shot diagnostic session.
-  //    We deliberately bypass SessionManager.send() to avoid two side-effects:
-  //      (a) if a session already exists, send() would append the diagnostic
-  //          prompt to its history, polluting the working context.
-  //      (b) if no session exists, send() would create one and bind it as the
-  //          "current" session, hijacking future fleet_send_message calls.
-  //    Instead: create → send → waitForIdle → getMessages → delete.
-  //    The session never touches SessionManager's cache.
-  const cwd = args["cwd"] ? String(args["cwd"]) : "/";
-  const prompt =
-    "Run the shell command `opencode debug config` and reply with ONLY the raw JSON " +
-    "output it produces — no explanation, no markdown code fence, no extra text. " +
-    "The output must start with `{` and end with `}`.";
-
-  let reply: string;
-  let diagSessionId: string | undefined;
-  try {
-    const diagSession = await node.createSession({ cwd, agent: "build" });
-    diagSessionId = diagSession.id;
-
-    await node.sendPromptAsync(diagSessionId, prompt);
-
-    // Wait for the slave to finish; use 60 s max for this lightweight task.
-    const diagTimeoutMs = Math.min(ctx.config.timeoutSeconds * 1000, 60_000);
-    let timedOut = false;
-    try {
-      await node.waitForIdle(diagSessionId, diagTimeoutMs);
-    } catch {
-      timedOut = true;
-    }
-
-    if (timedOut) {
-      // Clean up the dangling diagnostic session before returning.
-      try { await node.deleteSession(diagSessionId); } catch { /* best effort */ }
-      return err(
-        `Node "${nodeName}" did not respond within ${diagTimeoutMs / 1000}s while running ` +
-          `"opencode debug config". This is unusual — the diagnostic prompt is lightweight.\n\n` +
-          `Recommended actions:\n` +
-          `  1. Use fleet_node_health to confirm the node is still reachable.\n` +
-          `  2. Use fleet_list_sessions to inspect sessions on the node.\n` +
-          `  3. If the node is stuck, consider escalating to a human operator — ` +
-          `a node that cannot respond to a simple diagnostic prompt may need manual inspection.`
-      );
-    }
-
-    const messages = await node.getMessages(diagSessionId, 5);
-    reply = node.extractLastReply(messages);
-  } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return err(`Failed to query node "${nodeName}": ${msg}`);
-  } finally {
-    // Always clean up the diagnostic session so it doesn't litter the node.
-    if (diagSessionId) {
-      try { await node.deleteSession(diagSessionId); } catch { /* best effort */ }
-    }
-  }
-
-  // 3. Extract JSON from the reply using brace-depth counting.
-  //    The slave may wrap output in markdown fences despite being asked not to;
-  //    we find the first `{` and scan forward to the matching `}`.
-  let configJson: unknown = null;
-  const jsonStart = reply.indexOf("{");
-  if (jsonStart !== -1) {
-    const jsonEnd = findJsonEnd(reply, jsonStart);
-    if (jsonEnd !== -1) {
-      try {
-        configJson = JSON.parse(reply.slice(jsonStart, jsonEnd + 1));
-      } catch {
-        // Leave configJson null — will fall through to the raw-reply path
-      }
-    }
-  }
-
-  const lines: string[] = [`Node: ${nodeName}`, `URL:  ${node.baseUrl}`, ""];
-
-  if (configJson !== null) {
-    lines.push("── Permission Policy ────────────────────────────────────");
-    lines.push(formatPermissions(configJson));
-    lines.push("");
-    lines.push("── Capability Summary ───────────────────────────────────");
-    lines.push(capabilitySummary(configJson));
-  } else {
-    lines.push("── Raw config output (could not parse JSON) ─────────────");
-    lines.push(reply.slice(0, 2000));
-    if (reply.length > 2000) lines.push("…(truncated)");
-  }
-
-  return ok(lines.join("\n"));
-}
 
 export async function dispatchTool(
   ctx: FleetContext,
@@ -1263,8 +1226,6 @@ export async function dispatchTool(
       return handleInterruptSession(ctx, args);
     case "fleet_get_session_status":
       return handleGetSessionStatus(ctx, args);
-    case "fleet_describe_node":
-      return handleDescribeNode(ctx, args);
     default:
       return err(`Unknown tool: ${toolName}`);
   }
