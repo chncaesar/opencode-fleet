@@ -186,6 +186,21 @@ The master naturally calls `fleet_node_health` before first use to confirm the n
 - Capability summary covers bash / write / edit and any other configured tools, reporting five cases: allow-all, deny-all, ask-all, mixed rules, no rules configured.
 - On timeout: returns structured three-step escalation guidance prompting human inspection.
 
+**Why slave-session approach instead of SSH file read (design trade-off):**
+
+Two approaches were considered for fetching the slave's permission config:
+
+1. **SSH file read** — reads `/etc/opencode/opencode.jsonc` (or platform equivalent) directly. Idempotent, creates no session, no state side-effects. Requires fleet to have SSH credentials and host-key access to each slave machine.
+2. **Slave session running `opencode debug config`** — no SSH credentials needed. Returns the fully-merged runtime config (all layers resolved). Creates a one-shot diagnostic session; does not touch `SessionManager` binding (see open issues below for current status).
+
+Current implementation uses approach 2. Approach 1 would be cleaner but introduces a deployment requirement (SSH key management) that approach 2 avoids.
+
+**Open issues (from review_20260724 — not yet fixed):**
+
+- **[C1] Session state pollution** (`src/tools.ts` — `handleDescribeNode`): current implementation calls `ctx.sessions.send()` which creates and binds a new session, or appends the diagnostic prompt to an existing work session. The correct fix is a true one-shot session: `createSession` → `sendPromptAsync` → `waitForIdle` → `getMessages` → `deleteSession`, never touching the `SessionManager` binding. Until fixed, do not call `fleet_node_health` (with `include_capabilities: true`) while a work session is in progress on that node.
+- **[C2] JSON extraction fragility** (`src/tools.ts`): if the implementation uses `indexOf("{")` + `lastIndexOf("}")` rather than true bracket-depth counting, it will silently truncate or corrupt the parsed JSON when the slave appends text containing `}` after the JSON blob — potentially dropping permission rules without error. Fix: use bracket-depth counting (`findJsonEnd`) as described above.
+- **[M1] `capabilitySummary` write/edit logic** (`src/tools.ts` — `capabilitySummary`): `some(v === "allow")` ignores `deny` rules entirely. A config `{"*": "deny", "/tmp/*": "allow"}` is reported as "file writes/edits: allowed (some patterns)". Fix: report deny rules explicitly so the master does not send write requests to restricted paths.
+
 ## Implementation notes
 
 - **Persistent SSE, not per-call**: The `StatusStream` is opened once per `OpenCodeNode` instance and shared. `waitForIdle()` registers a waiter on the shared stream rather than opening a new HTTP connection.
