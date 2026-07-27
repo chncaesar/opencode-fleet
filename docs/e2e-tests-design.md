@@ -4,7 +4,7 @@ Date: 2026-07-23
 
 ## Context
 
-opencode-fleet currently has 26 unit tests (all mock-based). This spec adds a separate E2E test suite that runs against real OpenCode server instances, validating the full request path from MCP tool handlers down to actual HTTP calls and SSE event streams.
+opencode-fleet currently has 24 unit tests (all mock-based). This spec adds a separate E2E test suite that runs against real OpenCode server instances, validating the full request path from MCP tool handlers down to actual HTTP calls and SSE event streams.
 
 Two slave nodes are available for testing:
 - opt186: Ubuntu 24.04, `http://192.168.88.186:4096`
@@ -14,7 +14,7 @@ Two slave nodes are available for testing:
 
 - Validate that all 11 MCP tools work correctly against real OpenCode nodes
 - Test SSE idle detection under realistic timing (not mocked)
-- Test timeout and partial-reply behavior with a genuinely slow prompt
+- Test fire-and-forget dispatch behavior: `fleet_send_message` returns immediately, status polled via `fleet_get_session_status`
 - Keep `npm test` (unit tests) runnable with zero external dependencies
 - Support open-source users: slave nodes configured via environment variables, not hardcoded
 
@@ -70,10 +70,9 @@ Two classes of prompts are used:
 Used for: connectivity, session creation, message format, tool connectivity checks.
 
 **Slow prompt** — `"Write a 50-line Python quicksort implementation with inline comments explaining each step"` (5–15s on real LLM)
-Used for: SSE idle wait validation, timeout triggering, partial reply, interrupt.
+Used for: SSE idle wait validation, interrupt testing, concurrent dispatch.
 
-Timeout test: slow prompt + 3s timeout → expect `timedOut=true`, `messages` non-empty.
-Normal wait test: slow prompt + 60s timeout → expect complete reply returned.
+Full-cycle test: dispatch slow prompt via `fleet_send_message` → poll `fleet_get_session_status` until idle → retrieve via `fleet_get_session_messages`.
 
 ## Test Cases
 
@@ -98,10 +97,9 @@ Each test runs against each configured node independently.
 
 | Test | What is verified |
 |------|-----------------|
-| lazy create | first send() creates a session automatically |
-| session reuse | two consecutive send() calls use the same session ID |
-| 404 auto-rebuild | manually delete session, next send() recreates and succeeds |
-| timedOut partial reply | slow prompt + 3s timeout → timedOut=true, messages non-empty |
+| lazy create | first sendAsync() creates a session automatically |
+| session reuse | two consecutive sendAsync() calls use the same session ID |
+| 404 auto-rebuild | manually delete session, next sendAsync() recreates and succeeds |
 
 ### tools.e2e.ts — All 11 MCP tools
 
@@ -113,8 +111,8 @@ Each test runs against each configured node independently.
 | fleet_create_session | created session ID appears in fleet_list_sessions result |
 | fleet_switch_session | after switch, session ID changes in manager |
 | fleet_list_models | returns non-empty model list |
-| fleet_send_message (fast) | fast prompt returns complete reply |
-| fleet_send_message (slow) | slow prompt returns complete reply within 60s |
+| fleet_send_message | dispatches prompt, returns session ID + dispatched status immediately |
+| fleet_send_message + poll | dispatch slow prompt → poll fleet_get_session_status until idle → verify messages via fleet_get_session_messages |
 | fleet_get_session_messages | returns list containing assistant message |
 | fleet_interrupt_session | interrupt during slow prompt → session becomes idle |
 | fleet_reset_session (guard) | reset while busy → returns error, instructs to interrupt first |
@@ -126,7 +124,7 @@ Each test runs against each configured node independently.
 
 | Test | What is verified |
 |------|-----------------|
-| concurrent send | simultaneous slow prompts to both nodes complete independently |
+| concurrent send | dispatch slow prompts to both nodes simultaneously via fleet_send_message, poll both independently until idle |
 | cross-node session isolation | opt186 sessions do not appear in windows session list |
 
 ## Harness (cleanup)
