@@ -12,7 +12,7 @@
  * creates a new one.
  */
 
-import { OpenCodeNode, TimeoutError, type MessageWithParts } from "./node.js";
+import { OpenCodeNode } from "./node.js";
 import type { FleetConfig } from "./config.js";
 
 export interface SendOptions {
@@ -37,29 +37,23 @@ export interface SendOptions {
   reasoningEffort?: string;
 }
 
-export interface SendResult {
-  /** The last assistant text extracted from the session. */
-  reply: string;
-  /** True if the session returned an error part. */
-  hasError: boolean;
+export interface AsyncSendResult {
   /**
-   * True if the wait timed out before the agent became idle.
-   * The agent is likely STILL RUNNING on the remote node.
-   * Do NOT reset the session on timeout — use fleet_get_session_status to
-   * check the agent's state and fleet_interrupt_session if you need to stop it.
+   * The session ID that received the prompt.
+   * Use with fleet_get_session_status / fleet_get_session_messages.
    */
-  timedOut: boolean;
-  /** Raw messages (newest-first) at time of completion. */
-  messages: MessageWithParts[];
+  sessionId: string;
+  /** Always "dispatched" — the prompt was sent and the agent is now running. */
+  nodeStatus: "dispatched";
 }
 
 export class SessionManager {
   /** Map from node name → active session ID */
   private sessionIds = new Map<string, string>();
-  private readonly timeoutMs: number;
 
-  constructor(config: FleetConfig) {
-    this.timeoutMs = config.timeoutSeconds * 1000;
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  constructor(_config: FleetConfig) {
+    // config reserved for future use (e.g. per-node overrides)
   }
 
   /**
@@ -73,7 +67,7 @@ export class SessionManager {
     const cached = this.sessionIds.get(node.name);
     if (cached) {
       // Trust the cached ID; if it's stale, sendPromptAsync will return 404
-      // and send() will recreate it automatically.
+      // and sendAsync() will recreate it automatically.
       return cached;
     }
 
@@ -111,17 +105,21 @@ export class SessionManager {
   }
 
   /**
-   * Send a prompt to a node and wait for the agent to finish.
+   * Fire-and-forget: send a prompt to a node and return immediately.
+   *
+   * The prompt is dispatched asynchronously — the agent starts running in the
+   * background. Use fleet_get_session_status to poll for completion and
+   * fleet_get_session_messages to retrieve the result.
    *
    * @param node     Target OpenCodeNode.
    * @param prompt   The prompt text to send.
    * @param options  Optional agent/model/reasoningEffort overrides.
    */
-  async send(
+  async sendAsync(
     node: OpenCodeNode,
     prompt: string,
     options: SendOptions = {}
-  ): Promise<SendResult> {
+  ): Promise<AsyncSendResult> {
     let sessionId = await this.getOrCreateSession(node, options);
 
     // Attempt to send; on 404 recreate and retry once
@@ -143,34 +141,7 @@ export class SessionManager {
       }
     }
 
-    // Wait for idle via SSE; a TimeoutError means the agent is still running —
-    // it is NOT a failure.  We capture it, fetch partial messages, and surface
-    // a diagnostic reply so the master can decide what to do next.
-    let timedOut = false;
-    try {
-      await node.waitForIdle(sessionId, this.timeoutMs);
-    } catch (waitErr: unknown) {
-      if (waitErr instanceof TimeoutError) {
-        timedOut = true;
-        // Fall through — fetch whatever messages are available so the master
-        // can see tool activity and make an informed decision.
-      } else {
-        throw waitErr;
-      }
-    }
-
-    // Fetch last messages
-    const messages = await node.getMessages(sessionId, 10);
-    const reply = node.extractLastReply(messages);
-
-    // Detect error in assistant message info
-    const hasError = messages.some(
-      (mwp) =>
-        mwp.info.role === "assistant" &&
-        (mwp.info as { error?: unknown }).error != null
-    );
-
-    return { reply, hasError, timedOut, messages };
+    return { sessionId, nodeStatus: "dispatched" };
   }
 }
 

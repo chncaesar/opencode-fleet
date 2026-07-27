@@ -24,7 +24,7 @@ tests/
       env.ts         — Env var reading, skipIf guards, prompt factories
       harness.ts     — before/after hooks for session cleanup
     node.e2e.ts      — Live-node tests: ping, sessions, messages, waitForIdle, getSessionStatus
-    session.e2e.ts   — SessionManager live tests: lazy create, reuse, 404 rebuild, timeout
+    session.e2e.ts   — SessionManager live tests: lazy create, reuse, 404 rebuild
     tools.e2e.ts     — All 11 fleet_* tool handlers against live nodes + dual-node tests
 vitest.e2e.config.ts  — E2E vitest config (60s timeout, forks, verbose)
 .env.e2e.example      — Template for E2E environment variables
@@ -41,7 +41,7 @@ npm run build     # tsc, output → dist/
 Run automated tests with:
 
 ```bash
-npm test          # vitest, 26 unit tests (zero dependency, mocked HTTP)
+npm test          # vitest, 24 unit tests (zero dependency, mocked HTTP)
 npm run test:e2e  # vitest, 33 live tests (requires a running opencode slave node)
 ```
 
@@ -64,7 +64,7 @@ Why not `/api/session/active`: The desktop client never uses this endpoint — i
 
 ### Session lifecycle (`session.ts`)
 
-One session per node, created lazily on the first `send()`. The session ID is cached in a `Map<nodeName, sessionId>`. If `sendPromptAsync` returns 404, the session is recreated automatically and the prompt is retried once. `fleet_reset_session` clears the cache entry manually.
+One session per node, created lazily on the first `sendAsync()`. The session ID is cached in a `Map<nodeName, sessionId>`. If `sendPromptAsync` returns 404, the session is recreated automatically and the prompt is retried once. `fleet_reset_session` clears the cache entry manually.
 
 ### Authentication
 
@@ -125,26 +125,31 @@ This section is directed at AI agents (Claude, OpenCode) acting as the **master*
 
 ### Mental model
 
-A `fleet_send_message` call blocks until the slave becomes idle **or** a timeout fires. A **timeout is not a failure** — it means the slave is still working and simply did not finish within the allotted window. The slave session is still alive and should not be discarded.
+`fleet_send_message` is **fire-and-forget**: it dispatches a prompt to a slave node and returns immediately with the session ID. The slave runs autonomously in the background. The master never blocks waiting for a single slave — it can dispatch to multiple nodes in the same turn and poll them independently.
 
-The tool itself encodes this guidance in its return value. When `fleet_send_message` returns `status: "timeout_still_busy"`, follow the `hint` field — it will say to wait and check status, not to reset.
+The standard workflow for any task:
 
-### Structured return values from fleet_send_message
+1. **Dispatch** — call `fleet_send_message` for each slave. Returns immediately.
+2. **Poll** — call `fleet_get_session_status` until status is `idle`.
+3. **Retrieve** — call `fleet_get_session_messages` to get the result.
 
-The tool returns structured status so you do not need to infer intent from raw text:
+### Concurrent dispatch pattern
 
-| `status` field | Meaning | What to do |
-|---|---|---|
-| `completed` | Slave finished, reply is ready | Use the reply |
-| `completed` + empty `reply` | Agent was mid-step (tool call in progress) | Check `fleet_get_session_messages` for context |
-| `timeout_still_busy` | Slave is still working, timeout elapsed | Wait, then call `fleet_get_session_status` — do NOT reset |
-| `queued` | Slave was busy, message has been queued | Wait for current task to finish before sending more |
-| `error` | Slave returned an error | Inspect reply, decide to retry or fix |
+Dispatch multiple slaves in the same turn, then poll all of them:
 
-### Rules
+```
+# Turn 1 — dispatch concurrently
+fleet_send_message(node_A, "task A")  → session_A
+fleet_send_message(node_B, "task B")  → session_B
 
-1. **Timeout means busy, not broken.** When `status` is `timeout_still_busy`, the slave is still working. Wait.
-2. **Escalate to human** if the slave is stuck and you cannot determine why after two attempts. Do not loop indefinitely. The tool will set `escalate_hint: true` when this threshold is reached.
+# Turn 2+ — poll until both idle
+fleet_get_session_status(node_A)
+fleet_get_session_status(node_B)
+
+# When both idle — retrieve results
+fleet_get_session_messages(node_A)
+fleet_get_session_messages(node_B)
+```
 
 ### Tool quick-reference
 
@@ -152,6 +157,7 @@ The tool returns structured status so you do not need to infer intent from raw t
 |---|---|
 | Check node health **and** understand what it can do before dispatching | `fleet_node_health` (returns ping + capability summary by default) |
 | Fast lightweight ping only (no capability fetch) | `fleet_node_health` with `include_capabilities: false` |
+| Dispatch a task to a slave | `fleet_send_message` (returns immediately with session ID) |
 | Check if slave finished | `fleet_get_session_status` |
 | See what slave did / is doing | `fleet_get_session_messages` |
 | Stop a running task (keep session) | `fleet_interrupt_session` |

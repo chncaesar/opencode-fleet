@@ -6,7 +6,7 @@
  *
  * Tools:
  *   fleet_list_nodes         — list all configured nodes + health
- *   fleet_send_message       — send a prompt to a node and wait for reply
+ *   fleet_send_message       — fire-and-forget: dispatch a prompt to a node, return immediately
  *   fleet_get_session_messages — fetch message history from a node's session
  *   fleet_reset_session      — discard cached session for a node
  *   fleet_node_health        — check health + capability summary of a node (include_capabilities defaults to true)
@@ -20,7 +20,7 @@
 
 import { OpenCodeNode } from "./node.js";
 import { SessionManager } from "./session.js";
-import type { SendOptions } from "./session.js";
+import type { SendOptions, AsyncSendResult } from "./session.js";
 import type { FleetConfig } from "./config.js";
 import type {
   Part,
@@ -71,10 +71,11 @@ export const TOOL_DEFINITIONS = [
   {
     name: "fleet_send_message",
     description:
-      "Send a prompt to a specific remote OpenCode node and wait for it to finish. " +
-      "The node runs the prompt autonomously and returns the last assistant reply. " +
-      "This call blocks until the remote agent is idle (or until timeout). " +
-      "Use this to dispatch tasks to specialist nodes.",
+      "Send a prompt to a specific remote OpenCode node and return immediately without waiting for completion. " +
+      "The node runs the prompt autonomously in the background. " +
+      "Use this to dispatch tasks to one or more nodes concurrently. " +
+      "After dispatching, use fleet_get_session_status to poll for completion, " +
+      "then fleet_get_session_messages to retrieve the result.",
     inputSchema: {
       type: "object",
       properties: {
@@ -412,39 +413,20 @@ export async function handleSendMessage(
   if (args["cwd"]) options.cwd = String(args["cwd"]);
 
   try {
-    const result = await ctx.sessions.send(node, prompt, options);
+    const result: AsyncSendResult = await ctx.sessions.sendAsync(node, prompt, options);
 
-    const lines: string[] = [];
-    lines.push(`Node: ${nodeName}`);
+    const lines: string[] = [
+      `Node: ${nodeName}`,
+      `Status: dispatched — agent is now running in the background`,
+      `Session: ${result.sessionId}`,
+      ``,
+      `Next steps:`,
+      `  1. Call fleet_get_session_status to check if the agent has finished.`,
+      `  2. Call fleet_get_session_messages to retrieve the result when done.`,
+      `  3. Call fleet_interrupt_session to stop it early if needed.`,
+    ];
 
-    if (result.timedOut) {
-      lines.push(`Status: TIMEOUT — agent is still running (not a failure)`);
-      lines.push(`Session: ${ctx.sessions.getSessionId(nodeName) ?? "(unknown)"}`);
-      lines.push("");
-      lines.push("The remote agent did not finish within the timeout window.");
-      lines.push("It is STILL RUNNING. Do NOT reset the session.");
-      lines.push("");
-      lines.push("Recommended next steps:");
-      lines.push("  1. Call fleet_get_session_status to check if still busy.");
-      lines.push("  2. Call fleet_get_session_messages to see current progress.");
-      lines.push("  3. Wait and retry fleet_send_message with a follow-up prompt.");
-      lines.push("  4. Call fleet_interrupt_session only if you need to stop it early.");
-      lines.push("  5. LAST RESORT: fleet_reset_session (loses all session context).");
-      lines.push("");
-      lines.push("--- Partial output (agent still working) ---");
-      lines.push(result.reply || "(no output yet — agent may be in early tool-call phase)");
-      // Timeout is not an error — master should not panic-reset
-      return ok(lines.join("\n"));
-    }
-
-    lines.push(`Status: ${result.hasError ? "completed with error" : "completed"}`);
-    lines.push("");
-    lines.push("--- Reply ---");
-    lines.push(result.reply || "(no text reply)");
-
-    return result.hasError
-      ? err(lines.join("\n"))
-      : ok(lines.join("\n"));
+    return ok(lines.join("\n"));
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     return err(`Failed to send message to "${nodeName}": ${msg}`);
