@@ -32,35 +32,70 @@ opencode-fleet (MCP server, this package)
     └─► fleet_send_message → Windows node (opencode serve at 192.168.1.20:4096)
 ```
 
-Each remote machine runs `opencode serve`. The fleet server opens a persistent SSE connection to each node on startup, maintaining a local status cache. `fleet_get_session_status` reads this cache — O(1), no network request. `fleet_send_message` blocks until the SSE stream emits `session.status: idle`, then returns the reply with zero polling lag.
+Each remote machine runs `opencode serve`. The fleet server opens a persistent SSE connection to each node on startup, maintaining a local status cache. `fleet_send_message` dispatches a prompt and returns immediately with the session ID — the slave runs in the background. Use `fleet_get_session_status` to poll for completion (reads from local cache, O(1), no network) and `fleet_get_session_messages` to retrieve the result.
 
 ## Slave setup (remote machines)
 
-On each machine that the master will control:
+On each machine that the master will control, start opencode in server mode with `--auto`:
 
 **Linux / macOS:**
 
 ```bash
-# The server must bind to 0.0.0.0 so it is reachable from other hosts.
-# Set a password if you want Basic Auth (recommended on untrusted LANs).
-OPENCODE_SERVER_PASSWORD=your-password opencode serve --hostname 0.0.0.0 --port 4096
+# --auto: deny rules return errors immediately (no approval prompts), preventing deadlocks.
+# Bind to 0.0.0.0 so the node is reachable from other hosts.
+OPENCODE_SERVER_PASSWORD=your-password opencode serve --hostname 0.0.0.0 --port 4096 --auto
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
 $env:OPENCODE_SERVER_PASSWORD="your-password"
-opencode serve --hostname 0.0.0.0 --port 4096
+opencode serve --hostname 0.0.0.0 --port 4096 --auto
 ```
 
 **Windows (Command Prompt):**
 
 ```cmd
 set OPENCODE_SERVER_PASSWORD=your-password
-opencode serve --hostname 0.0.0.0 --port 4096
+opencode serve --hostname 0.0.0.0 --port 4096 --auto
 ```
 
+`--auto` is required. Without it, any `ask`-level permission triggers an approval prompt that blocks forever in server mode — the session stays busy indefinitely and the fleet appears hung.
+
 Note the URL that is printed — you will use it in the master's `opencode.json`.
+
+## Slave permission configuration
+
+opencode's built-in `permission` system controls what tools the slave agent can use. Configure it in `opencode.jsonc` in the project directory, or in the platform managed config path for global enforcement (highest priority, cannot be overridden by project config):
+
+- **Linux**: `/etc/opencode/opencode.jsonc`
+- **macOS**: `/Library/Application Support/opencode/opencode.jsonc`
+- **Windows**: `%ProgramData%\opencode\opencode.jsonc`
+
+Example — allow only safe operations, deny everything else:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "bash": {
+      "*": "deny",
+      "git *": "allow",
+      "make *": "allow",
+      "cmake *": "allow",
+      "python3 *": "allow",
+      "rm /tmp/*": "allow"
+    },
+    "edit": {
+      "*": "deny",
+      "/work/code/**": "allow",
+      "/tmp/**": "allow"
+    }
+  }
+}
+```
+
+With `--auto`, `deny` rules return errors immediately — the slave agent reports the failure to the master instead of hanging. Use `fleet_node_health` (with `include_capabilities: true`, the default) to inspect the slave's effective permission policy before dispatching work.
 
 ## Installation
 
@@ -102,7 +137,7 @@ export FLEET_PASSWORD=your-shared-password
 | `--node name=url` | (required) | Register a remote node. Repeat for multiple nodes. |
 | `--password <pw>` | `""` | Shared Basic Auth password for all nodes. |
 | `--username <u>` | `opencode` | Shared Basic Auth username for all nodes. |
-| `--timeout <s>` | `600` | Seconds to wait for an agent to finish before giving up. |
+| `--timeout <s>` | `600` | Seconds to wait for the capability-fetch diagnostic session in `fleet_node_health`. Does not affect `fleet_send_message` (fire-and-forget). |
 
 Environment variable fallbacks: `FLEET_PASSWORD`, `FLEET_USERNAME`, `OPENCODE_SERVER_PASSWORD`.
 
@@ -116,7 +151,7 @@ Environment variable fallbacks: `FLEET_PASSWORD`, `FLEET_USERNAME`, `OPENCODE_SE
 | `fleet_list_sessions` | List all sessions on a node. |
 | `fleet_create_session` | Create a new session on a node with optional title, agent, and model. |
 | `fleet_switch_session` | Bind to an existing session by ID (for tools that target the "current" session). |
-| `fleet_send_message` | Send a prompt to a node and wait for the reply. |
+| `fleet_send_message` | Dispatch a prompt to a node and return immediately (fire-and-forget). Poll with `fleet_get_session_status`, retrieve with `fleet_get_session_messages`. |
 | `fleet_get_session_messages` | Fetch recent message history from a node's session. |
 | `fleet_get_session_status` | Check whether a node's session is idle or busy (local cache, zero network). |
 | `fleet_interrupt_session` | Signal a running session to stop (fire-and-forget; does not reset). |
@@ -127,11 +162,14 @@ Environment variable fallbacks: `FLEET_PASSWORD`, `FLEET_USERNAME`, `OPENCODE_SE
 ```
 Use fleet_list_nodes to check what machines are available.
 
-Then use fleet_send_message to the ubuntu node:
-  "Read the serial port logs at /tmp/serial.log and summarise the last 50 lines."
+Dispatch both tasks concurrently:
+  fleet_send_message to the ubuntu node:
+    "Read the serial port logs at /tmp/serial.log and summarise the last 50 lines."
+  fleet_send_message to the windows node:
+    "Check the HMI connection status and report what the UI shows."
 
-Once it replies, use fleet_send_message to the windows node:
-  "The Ubuntu simulator reported: <summary>. Update the HMI display config accordingly."
+Poll fleet_get_session_status for both nodes until idle, then
+use fleet_get_session_messages to retrieve each result and correlate.
 ```
 
 ## Session management
@@ -140,9 +178,11 @@ The fleet server maintains one session per node in memory. Sessions are created 
 
 ## Completion detection
 
-`fleet_send_message` uses a persistent SSE connection (`GET /event`) that is opened once on startup and shared by all status checks. When you send a prompt, the server registers a waiter on this shared stream and resolves the moment the session goes idle — identical to how the desktop client tracks completion. No polling, no extra HTTP requests, no unnecessary waiting.
+`fleet_send_message` is fire-and-forget: it dispatches a prompt and returns immediately with the session ID. The slave runs autonomously in the background via a persistent SSE connection (`GET /event`) opened once on startup.
 
-If the deadline (set by `--timeout`) is reached before the session goes idle, `fleet_send_message` returns a **non-error result** with a `Status: TIMEOUT` header and recommended next steps. The slave session is still running — do not reset it. Use `fleet_get_session_status` to check progress, and `fleet_interrupt_session` if you need to stop it.
+Poll `fleet_get_session_status` until the session is idle (reads from local SSE cache — O(1), no network), then call `fleet_get_session_messages` to retrieve the result.
+
+This model lets the master dispatch tasks to multiple nodes in the same turn and track them independently — no blocking, no forced sequencing.
 
 ## Security
 
