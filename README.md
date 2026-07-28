@@ -36,31 +36,28 @@ Each remote machine runs `opencode serve`. The fleet server opens a persistent S
 
 ## Slave setup (remote machines)
 
-On each machine that the master will control, start opencode in server mode with `--auto`:
+On each machine that the master will control, start opencode in server mode:
 
 **Linux / macOS:**
 
 ```bash
-# --auto: deny rules return errors immediately (no approval prompts), preventing deadlocks.
 # Bind to 0.0.0.0 so the node is reachable from other hosts.
-OPENCODE_SERVER_PASSWORD=your-password opencode serve --hostname 0.0.0.0 --port 4096 --auto
+OPENCODE_SERVER_PASSWORD=your-password opencode serve --hostname 0.0.0.0 --port 4096
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
 $env:OPENCODE_SERVER_PASSWORD="your-password"
-opencode serve --hostname 0.0.0.0 --port 4096 --auto
+opencode serve --hostname 0.0.0.0 --port 4096
 ```
 
 **Windows (Command Prompt):**
 
 ```cmd
 set OPENCODE_SERVER_PASSWORD=your-password
-opencode serve --hostname 0.0.0.0 --port 4096 --auto
+opencode serve --hostname 0.0.0.0 --port 4096
 ```
-
-`--auto` is required. Without it, any `ask`-level permission triggers an approval prompt that blocks forever in server mode — the session stays busy indefinitely and the fleet appears hung.
 
 Note the URL that is printed — you will use it in the master's `opencode.json`.
 
@@ -95,7 +92,9 @@ Example — allow only safe operations, deny everything else:
 }
 ```
 
-With `--auto`, `deny` rules return errors immediately — the slave agent reports the failure to the master instead of hanging. Use `fleet_node_health` (with `include_capabilities: true`, the default) to inspect the slave's effective permission policy before dispatching work.
+With `deny` rules, the slave agent reports the failure to the master instead of hanging. Use `fleet_node_health` (with `include_capabilities: true`, the default) to inspect the slave's effective permission policy before dispatching work.
+
+If a slave's permission policy includes `ask` rules — or no rules at all — the slave may pause and emit a `permission.asked` event, blocking the session. The fleet master detects this automatically: `fleet_get_session_status` will show the pending permission requests, and you can approve or deny them with `fleet_reply_permission` without leaving the chat.
 
 ## Installation
 
@@ -153,7 +152,8 @@ Environment variable fallbacks: `FLEET_PASSWORD`, `FLEET_USERNAME`, `OPENCODE_SE
 | `fleet_switch_session` | Bind to an existing session by ID (for tools that target the "current" session). |
 | `fleet_send_message` | Dispatch a prompt to a node and return immediately (fire-and-forget). Poll with `fleet_get_session_status`, retrieve with `fleet_get_session_messages`. |
 | `fleet_get_session_messages` | Fetch recent message history from a node's session. |
-| `fleet_get_session_status` | Check whether a node's session is idle or busy (local cache, zero network). |
+| `fleet_get_session_status` | Check whether a node's session is idle or busy (local cache, zero network). Shows pending permission requests when the session is blocked waiting for approval. |
+| `fleet_reply_permission` | Approve (`once`) or deny (`reject`) a pending permission request on a slave node, unblocking a session that is waiting for user decision. |
 | `fleet_interrupt_session` | Signal a running session to stop (fire-and-forget; does not reset). |
 | `fleet_reset_session` | Discard a node's session so the next call starts fresh (last resort). |
 
