@@ -530,6 +530,15 @@ export class OpenCodeNode {
     return this.request<Session>("POST", "/session", body);
   }
 
+  /**
+   * Fetch the node's merged runtime config via GET /config.
+   * Returns the raw parsed JSON (unknown shape — caller must narrow).
+   * Throws NodeError on HTTP failure.
+   */
+  async getConfig(): Promise<unknown> {
+    return this.request<unknown>("GET", "/config");
+  }
+
   /** List all available models on the node. */
   async listModels(): Promise<ModelInfo[]> {
     const result = await this.request<{ data?: ModelInfo[]; location?: unknown }>(

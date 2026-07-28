@@ -177,18 +177,18 @@ describe.skipIf(skipIfNoNodes)("Fleet tool handlers E2E", () => {
           cwd: "/tmp",
         });
         const t = assertOk(result);
-        expect(t).toContain("completed");
+        expect(t).toContain("dispatched");
       });
 
       // ── fleet_send_message (slow) ────────────────────────────────────────────
 
-      test("fleet_send_message completes slow prompt within 60s", async () => {
+      test("fleet_send_message dispatches slow prompt (fire-and-forget)", async () => {
         const result = await handleSendMessage(ctx, {
           node: nodeConfig.name,
           prompt: makeSlowPrompt(),
           cwd: "/tmp",
         });
-        // Non-error regardless of timing; if it timed out the result is still ok (not isError)
+        // Non-error; fire-and-forget returns immediately with "dispatched"
         expect(result.isError).toBeFalsy();
       });
 
@@ -263,14 +263,19 @@ describe.skipIf(skipIfNoNodes)("Fleet tool handlers E2E", () => {
       // ── fleet_reset_session: idle → succeeds ─────────────────────────────────
 
       test("fleet_reset_session succeeds when session is idle", async () => {
-        // Send a fast prompt and wait for idle.
-        await handleSendMessage(ctx, {
+        // Send a fast prompt, wait for it to finish, then reset.
+        const sendResult = await handleSendMessage(ctx, {
           node: nodeConfig.name,
           prompt: FAST_PROMPT,
           cwd: "/tmp",
         });
+        assertOk(sendResult);
+
+        // Wait for the session to become idle before attempting reset.
         const sid = ctx.sessions.getSessionId(nodeConfig.name);
         expect(sid).toBeDefined();
+        const ctxNode = ctx.nodes.get(nodeConfig.name)!;
+        await ctxNode.waitForIdle(sid!, 30_000);
 
         const result = await handleResetSession(ctx, { node: nodeConfig.name });
         const t = assertOk(result);
@@ -300,11 +305,18 @@ describe.skipIf(skipIfNoNodes)("Fleet tool handlers E2E", () => {
       // ── fleet_get_session_status: idle ────────────────────────────────────────
 
       test("fleet_get_session_status returns idle after prompt completes", async () => {
-        await handleSendMessage(ctx, {
+        const sendResult = await handleSendMessage(ctx, {
           node: nodeConfig.name,
           prompt: FAST_PROMPT,
           cwd: "/tmp",
         });
+        assertOk(sendResult);
+
+        // Wait for the session to become idle before checking status.
+        const sid = ctx.sessions.getSessionId(nodeConfig.name);
+        expect(sid).toBeDefined();
+        const ctxNode = ctx.nodes.get(nodeConfig.name)!;
+        await ctxNode.waitForIdle(sid!, 30_000);
 
         const result = await handleGetSessionStatus(ctx, { node: nodeConfig.name });
         const t = assertOk(result);
@@ -356,8 +368,8 @@ describe.skipIf(skipIfNotBothNodes)("Dual-node E2E", () => {
 
     expect(r1.isError).toBeFalsy();
     expect(r2.isError).toBeFalsy();
-    expect(text(r1)).toContain("completed");
-    expect(text(r2)).toContain("completed");
+    expect(text(r1)).toContain("dispatched");
+    expect(text(r2)).toContain("dispatched");
   });
 
   // ── Session IDs are isolated across nodes ──────────────────────────────────

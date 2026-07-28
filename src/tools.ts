@@ -660,68 +660,16 @@ export async function handleNodeHealth(
     return ok(headerLines.join("\n"));
   }
 
-  // Fetch permission policy via one-shot diagnostic session (same logic as
-  // handleDescribeNode, inlined here so fleet_node_health is self-contained).
-  const cwd = args["cwd"] ? String(args["cwd"]) : "/";
-  const prompt =
-    "Run the shell command `opencode debug config` and reply with ONLY the raw JSON " +
-    "output it produces — no explanation, no markdown code fence, no extra text. " +
-    "The output must start with `{` and end with `}`.";
-
-  let reply: string;
-  let diagSessionId: string | undefined;
+  // Fetch permission policy directly via GET /config — no session needed.
+  let configJson: unknown = null;
   try {
-    const diagSession = await node.createSession({ cwd, agent: "build" });
-    diagSessionId = diagSession.id;
-
-    await node.sendPromptAsync(diagSessionId, prompt);
-
-    const diagTimeoutMs = Math.min(ctx.config.timeoutSeconds * 1000, 60_000);
-    let timedOut = false;
-    try {
-      await node.waitForIdle(diagSessionId, diagTimeoutMs);
-    } catch {
-      timedOut = true;
-    }
-
-    if (timedOut) {
-      try { await node.deleteSession(diagSessionId); } catch { /* best effort */ }
-      diagSessionId = undefined;
-      return ok(
-        headerLines.join("\n") + "\n\n" +
-          `WARNING: Could not fetch capability summary — node did not respond within ` +
-          `${diagTimeoutMs / 1000}s while running "opencode debug config".\n` +
-          `The node is reachable but capability info is unavailable. ` +
-          `Escalate to a human operator if this persists.`,
-      );
-    }
-
-    const messages = await node.getMessages(diagSessionId, 5);
-    reply = node.extractLastReply(messages);
+    configJson = await node.getConfig();
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     return ok(
       headerLines.join("\n") + "\n\n" +
         `WARNING: Could not fetch capability summary: ${msg}`,
     );
-  } finally {
-    if (diagSessionId) {
-      try { await node.deleteSession(diagSessionId); } catch { /* best effort */ }
-    }
-  }
-
-  // Parse JSON from the reply using brace-depth counting.
-  let configJson: unknown = null;
-  const jsonStart = reply.indexOf("{");
-  if (jsonStart !== -1) {
-    const jsonEnd = findJsonEnd(reply, jsonStart);
-    if (jsonEnd !== -1) {
-      try {
-        configJson = JSON.parse(reply.slice(jsonStart, jsonEnd + 1));
-      } catch {
-        // leave null — fall through to raw-reply path
-      }
-    }
   }
 
   const lines: string[] = [...headerLines, ""];
@@ -734,8 +682,7 @@ export async function handleNodeHealth(
     lines.push(capabilitySummary(configJson));
   } else {
     lines.push("── Raw config output (could not parse JSON) ─────────────");
-    lines.push(reply.slice(0, 2000));
-    if (reply.length > 2000) lines.push("…(truncated)");
+    lines.push("(empty response from /config)");
   }
 
   return ok(lines.join("\n"));
