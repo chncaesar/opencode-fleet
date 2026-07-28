@@ -50,6 +50,37 @@ async function main(): Promise<void> {
       capabilities: {
         tools: {},
       },
+      instructions: `## Fleet Operation Protocol
+
+You are coordinating remote OpenCode nodes via fleet_* tools. Follow this protocol exactly.
+
+### Standard workflow (every task)
+1. Dispatch  — fleet_send_message returns immediately with a session ID. Never block.
+2. Poll      — fleet_get_session_status until status is "idle".
+3. Retrieve  — fleet_get_session_messages to get the result.
+
+Dispatch to multiple nodes in the same turn, then poll them independently.
+
+### Permission handling
+If fleet_get_session_status returns busy AND includes pending_permissions:
+  → Call fleet_reply_permission ("once" to approve, "reject" to deny).
+  → The slave unblocks automatically. Continue polling until idle.
+
+### First-use checklist (new session)
+1. fleet_list_nodes       — confirm nodes are configured
+2. fleet_node_health      — verify reachable + inspect permission policy
+3. fleet_send_message     — dispatch work
+4. fleet_get_session_status (poll) → fleet_get_session_messages (retrieve)
+
+### When things go wrong
+- Stuck busy (unexpectedly long): raise for human intervention.
+  Do NOT call fleet_interrupt_session — the slave may be doing legitimate
+  long-running work. Only interrupt when the human explicitly requests it.
+- After master restart (session binding lost): fleet_list_sessions to find
+  the session ID, then pass it explicitly to fleet_get_session_status /
+  fleet_get_session_messages.
+- Context corrupt / confused slave: fleet_reset_session is a LAST RESORT.
+  Only call it when the session is idle.`,
     }
   );
 

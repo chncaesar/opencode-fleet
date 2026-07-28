@@ -119,6 +119,8 @@ Returns `MessageWithParts[]` — each element is `{ info: Message, parts: Part[]
 
 ## Fleet operation protocol for master agents
 
+> **Note for developers:** The operational protocol below is also embedded as the MCP server's `instructions` field (injected automatically into every master LLM request by opencode). Users without this AGENTS.md file still receive the protocol via the MCP `initialize` handshake — no manual setup required.
+
 This section is directed at AI agents (Claude, OpenCode) acting as the **master** in a fleet session.
 
 ### Mental model

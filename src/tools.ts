@@ -328,7 +328,9 @@ export const TOOL_DEFINITIONS = [
       "Returns idle/busy/retry status without sending any new messages. " +
       "Use this after a fleet_send_message timeout to confirm whether the agent is still " +
       "running before deciding whether to wait, interrupt, or reset. " +
-      "If session_id is omitted, checks the currently bound session for the node.",
+      "If session_id is omitted, checks the currently bound session for the node. " +
+      "If the result shows busy AND includes pending_permissions, the slave is blocked " +
+      "waiting for approval — call fleet_reply_permission to unblock it, then continue polling.",
     inputSchema: {
       type: "object",
       properties: {
@@ -350,7 +352,8 @@ export const TOOL_DEFINITIONS = [
     description:
       "Reply to a pending permission request on a slave node. " +
       "Use \"once\" to approve this single invocation, or \"reject\" to deny it. " +
-      "The slave session will unblock and continue (once) or receive an error (reject).",
+      "The slave session will unblock and continue (once) or receive an error (reject). " +
+      "After replying, continue polling fleet_get_session_status until the session is idle.",
     inputSchema: {
       type: "object",
       properties: {
