@@ -197,6 +197,13 @@ All traffic is plain HTTP. Use a VPN or SSH tunnel when communicating over untru
 | [opencode-session-reflection](https://github.com/chncaesar/opencode-session-reflection) | Qualitative review of past coding sessions |
 | [opencode-fleet](https://github.com/chncaesar/opencode-fleet) | Multi-node remote OpenCode orchestration |
 
+## Release History
+
+| Version | Date | Changes |
+|---------|------|---------|
+| [0.2.0](https://github.com/chncaesar/opencode-fleet/releases/tag/v0.2.0) | 2026-07-28 | Embed fleet operation protocol as MCP server `instructions` field (auto-injected into every master LLM request). Fire-and-forget `fleet_send_message` with SSE-based status polling. `fleet_reply_permission` for handling slave permission prompts. Permission-aware `fleet_get_session_status`. Improved tool descriptions with inline workflow guidance. |
+| [0.1.0](https://github.com/chncaesar/opencode-fleet/releases/tag/v0.1.0) | 2026-07-25 | Initial release. Multi-node coordination, session management, persistent SSE status tracking, `fleet_node_health` with capability detection, 11 MCP tools. |
+
 ## License
 
 MIT
