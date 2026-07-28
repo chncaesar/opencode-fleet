@@ -4,6 +4,7 @@
  * Unit tests for OpenCodeNode utility methods:
  *   - extractLastReply: text / tool-only / empty
  *   - getSessionStatus: idle / busy / empty session
+ *   - permissionCache: applyEvent permission.asked, idle cleanup, removePendingPermission
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
@@ -262,5 +263,133 @@ describe("getSessionStatusFallback", () => {
     ]);
     const status = await node.getSessionStatusFallback("s1");
     expect(status.type).toBe("idle");
+  });
+});
+
+// ── permissionCache ───────────────────────────────────────────────────────────
+//
+// Tests for PendingPermission caching via applyEvent() and direct manipulation.
+
+describe("permissionCache", () => {
+  let node: OpenCodeNode;
+
+  beforeEach(() => {
+    node = makeNode();
+  });
+
+  afterEach(() => {
+    node.destroy();
+    vi.restoreAllMocks();
+  });
+
+  it("getPendingPermissions returns [] for an unknown session", () => {
+    expect(node.getPendingPermissions("ses_unknown")).toEqual([]);
+  });
+
+  it("applyEvent permission.asked stores the permission in permissionCache", () => {
+    node.applyEventForTesting({
+      type: "permission.asked",
+      properties: {
+        sessionID: "ses_abc",
+        id: "per_001",
+        permission: "bash",
+        patterns: ["rm -rf /tmp/build"],
+      },
+    });
+
+    const pending = node.getPendingPermissions("ses_abc");
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toEqual({
+      id: "per_001",
+      permission: "bash",
+      patterns: ["rm -rf /tmp/build"],
+    });
+  });
+
+  it("consecutive permission.asked events append to the list, not overwrite", () => {
+    node.applyEventForTesting({
+      type: "permission.asked",
+      properties: {
+        sessionID: "ses_abc",
+        id: "per_001",
+        permission: "bash",
+        patterns: ["rm -rf /tmp/build"],
+      },
+    });
+    node.applyEventForTesting({
+      type: "permission.asked",
+      properties: {
+        sessionID: "ses_abc",
+        id: "per_002",
+        permission: "write",
+        patterns: ["/etc/hosts"],
+      },
+    });
+
+    const pending = node.getPendingPermissions("ses_abc");
+    expect(pending).toHaveLength(2);
+    expect(pending[0].id).toBe("per_001");
+    expect(pending[1].id).toBe("per_002");
+  });
+
+  it("applyEvent session.status idle clears permissionCache for that session", () => {
+    node.applyEventForTesting({
+      type: "permission.asked",
+      properties: {
+        sessionID: "ses_abc",
+        id: "per_001",
+        permission: "bash",
+        patterns: ["make build"],
+      },
+    });
+    // Confirm it was stored
+    expect(node.getPendingPermissions("ses_abc")).toHaveLength(1);
+
+    // Now emit idle
+    node.applyEventForTesting({
+      type: "session.status",
+      properties: {
+        sessionID: "ses_abc",
+        status: { type: "idle" },
+      },
+    });
+
+    expect(node.getPendingPermissions("ses_abc")).toEqual([]);
+  });
+
+  it("removePendingPermission removes only the specified requestId", () => {
+    node.injectPermissionForTesting("ses_abc", [
+      { id: "per_001", permission: "bash", patterns: ["make"] },
+      { id: "per_002", permission: "write", patterns: ["/tmp/out.txt"] },
+    ]);
+
+    node.removePendingPermission("ses_abc", "per_001");
+
+    const pending = node.getPendingPermissions("ses_abc");
+    expect(pending).toHaveLength(1);
+    expect(pending[0].id).toBe("per_002");
+  });
+
+  it("deprecated session.idle event also clears permissionCache for that session", () => {
+    // session.idle is the deprecated event type — applyEvent handles it the same
+    // as session.status { type: "idle" }. Both must clear permissionCache.
+    node.applyEventForTesting({
+      type: "permission.asked",
+      properties: {
+        sessionID: "ses_xyz",
+        id: "per_dep_001",
+        permission: "write",
+        patterns: ["/tmp/dep-test"],
+      },
+    });
+    expect(node.getPendingPermissions("ses_xyz")).toHaveLength(1);
+
+    // Emit the deprecated event type
+    node.applyEventForTesting({
+      type: "session.idle",
+      properties: { sessionID: "ses_xyz" },
+    });
+
+    expect(node.getPendingPermissions("ses_xyz")).toEqual([]);
   });
 });

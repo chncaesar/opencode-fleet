@@ -16,6 +16,7 @@
  *   fleet_list_models        — list available models on a node
  *   fleet_interrupt_session  — send abort signal to a running session
  *   fleet_get_session_status — check if a session is idle or busy
+ *   fleet_reply_permission   — reply to a pending permission request (approve once or reject)
  */
 
 import { OpenCodeNode } from "./node.js";
@@ -342,6 +343,42 @@ export const TOOL_DEFINITIONS = [
         },
       },
       required: ["node"],
+    },
+  },
+  {
+    name: "fleet_reply_permission",
+    description:
+      "Reply to a pending permission request on a slave node. " +
+      "Use \"once\" to approve this single invocation, or \"reject\" to deny it. " +
+      "The slave session will unblock and continue (once) or receive an error (reject).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        node: {
+          type: "string",
+          description: "Name of the target node.",
+        },
+        request_id: {
+          type: "string",
+          description:
+            "Permission request ID (from fleet_get_session_status pendingPermissions list).",
+        },
+        reply: {
+          type: "string",
+          enum: ["once", "reject"],
+          description: "\"once\" to approve this single invocation, \"reject\" to deny it.",
+        },
+        session_id: {
+          type: "string",
+          description:
+            "Optional session ID. If omitted, uses the node's currently bound session.",
+        },
+        message: {
+          type: "string",
+          description: "Optional message to send alongside the reply.",
+        },
+      },
+      required: ["node", "request_id", "reply"],
     },
   },
 ] as const;
@@ -921,6 +958,23 @@ export async function handleGetSessionStatus(
       lines.push("The agent is currently executing. Do NOT reset the session.");
       lines.push("Use fleet_get_session_messages to see current progress.");
       lines.push("Use fleet_interrupt_session to stop it early if needed.");
+
+      // Append pending permission details if any are waiting for approval.
+      const pending = node.getPendingPermissions(sessionId);
+      if (pending.length > 0) {
+        lines.push("");
+        lines.push(
+          "Permission approval required — session is blocked waiting for user decision."
+        );
+        lines.push(`Pending permissions (${pending.length} item(s)):`);
+        pending.forEach((p, i) => {
+          const patternsStr = JSON.stringify(p.patterns);
+          lines.push(`  [${i + 1}] id=${p.id}  tool=${p.permission}  patterns=${patternsStr}`);
+        });
+        lines.push(
+          "Next step: call fleet_reply_permission with the request id to approve (once) or reject."
+        );
+      }
     } else if (status.type === "retry") {
       const r = status as Extract<SessionStatus, { type: "retry" }>;
       lines.push(`Attempt: ${r.attempt}`);
@@ -935,6 +989,62 @@ export async function handleGetSessionStatus(
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     return err(`Failed to get session status from "${nodeName}": ${msg}`);
+  }
+}
+
+// fleet_reply_permission ───────────────────────────────────────────────────────
+
+export async function handleReplyPermission(
+  ctx: FleetContext,
+  args: Record<string, unknown>
+): Promise<ToolResult> {
+  const nodeName = String(args["node"] ?? "");
+  if (!nodeName) return err("Missing required argument: node");
+
+  const node = ctx.nodes.get(nodeName);
+  if (!node) {
+    return err(
+      `Unknown node "${nodeName}". Available: ${Array.from(ctx.nodes.keys()).join(", ")}`
+    );
+  }
+
+  const requestId = String(args["request_id"] ?? "");
+  if (!requestId) return err("Missing required argument: request_id");
+
+  const replyRaw = String(args["reply"] ?? "");
+  if (replyRaw !== "once" && replyRaw !== "reject") {
+    return err(`Invalid reply value "${replyRaw}". reply must be "once" or "reject".`);
+  }
+  const reply = replyRaw as "once" | "reject";
+
+  // Resolve session ID: explicit arg > current binding
+  const explicitId = args["session_id"] ? String(args["session_id"]) : undefined;
+  const sessionId = explicitId ?? ctx.sessions.getSessionId(nodeName);
+  if (!sessionId) {
+    return err(
+      `Node "${nodeName}" has no active session and no session_id was provided. ` +
+        `Use fleet_list_sessions to find a session ID.`
+    );
+  }
+
+  const message = args["message"] ? String(args["message"]) : undefined;
+
+  try {
+    await node.replyPermission(sessionId, requestId, reply, message);
+    node.removePendingPermission(sessionId, requestId);
+    const consequence =
+      reply === "once"
+        ? "Session is now unblocked. Use fleet_get_session_status to monitor progress."
+        : "The tool call has been denied. The slave agent will receive an error and may continue with alternative steps.";
+    return ok(
+      `Permission request ${requestId} on node "${nodeName}" (session ${sessionId}): replied "${reply}".\n` +
+        consequence
+    );
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return err(
+      `Failed to reply to permission request "${requestId}" on "${nodeName}": ${msg}`
+    );
   }
 }
 
@@ -1155,6 +1265,8 @@ export async function dispatchTool(
       return handleInterruptSession(ctx, args);
     case "fleet_get_session_status":
       return handleGetSessionStatus(ctx, args);
+    case "fleet_reply_permission":
+      return handleReplyPermission(ctx, args);
     default:
       return err(`Unknown tool: ${toolName}`);
   }

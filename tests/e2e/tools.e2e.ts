@@ -24,10 +24,12 @@ import {
   handleInterruptSession,
   handleResetSession,
   handleGetSessionStatus,
+  handleReplyPermission,
   buildContext,
   type FleetContext,
 } from "../../src/tools.js";
 import { OpenCodeNode } from "../../src/node.js";
+import type { PendingPermission } from "../../src/node.js";
 import {
   configuredNodes,
   skipIfNoNodes,
@@ -321,6 +323,64 @@ describe.skipIf(skipIfNoNodes)("Fleet tool handlers E2E", () => {
         const result = await handleGetSessionStatus(ctx, { node: nodeConfig.name });
         const t = assertOk(result);
         expect(t).toContain("idle");
+      });
+
+      // ── fleet_get_session_status: injected pending permissions ────────────────
+      //
+      // These tests use injectPermissionForTesting to set up permission state
+      // without a live pending permission request. They verify that the
+      // fleet_get_session_status output includes the expected permission paragraph.
+
+      test("fleet_get_session_status with injected pending permissions includes permission paragraph", async () => {
+        // Inject a fake busy status and permission so the handler sees pending requests.
+        const ctxNode = ctx.nodes.get(nodeConfig.name)!;
+        const fakeSessionId = "ses_injected_e2e_test";
+        ctx.sessions.setSessionId(nodeConfig.name, fakeSessionId);
+
+        const injected: PendingPermission[] = [
+          { id: "per_inject_001", permission: "bash", patterns: ["rm -rf /tmp/test"] },
+        ];
+        ctxNode.injectPermissionForTesting(fakeSessionId, injected);
+        // Also inject busy status so the handler queries pending permissions.
+        ctxNode.injectStatusForTesting(fakeSessionId, { type: "busy" });
+
+        try {
+          const result = await handleGetSessionStatus(ctx, { node: nodeConfig.name });
+          const t = assertOk(result);
+          expect(t).toContain("Status: busy");
+          expect(t).toContain("Permission approval required");
+          expect(t).toContain("per_inject_001");
+          expect(t).toContain("bash");
+          expect(t).toContain("fleet_reply_permission");
+        } finally {
+          // Clean up injected state.
+          ctxNode.removePendingPermission(fakeSessionId, "per_inject_001");
+          ctx.sessions.resetSession(nodeConfig.name);
+        }
+      });
+
+      // ── fleet_reply_permission: injected state, HTTP will 404 ─────────────────
+      //
+      // fleet_reply_permission sends a real HTTP request to the slave. Since there
+      // is no real pending permission on the slave, the slave will return a non-204
+      // status (404 or 400). This tests that the handler surfaces the error correctly.
+      // The test verifies: (a) handler returns isError=true, (b) error message
+      // contains the request ID so the master can act on it.
+
+      test("fleet_reply_permission returns error when slave has no matching permission request", async () => {
+        const fakeSessionId = "ses_injected_e2e_test";
+        ctx.sessions.setSessionId(nodeConfig.name, fakeSessionId);
+
+        const result = await handleReplyPermission(ctx, {
+          node: nodeConfig.name,
+          session_id: fakeSessionId,
+          request_id: "per_nonexistent_001",
+          reply: "once",
+        });
+
+        // The slave has no such permission request, so HTTP will fail.
+        // Handler must surface isError=true.
+        assertErr(result);
       });
     });
   }

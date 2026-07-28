@@ -9,6 +9,20 @@ import type { NodeConfig } from "./config.js";
 
 // ── OpenCode REST types (subset) ──────────────────────────────────────────────
 
+/**
+ * A pending permission request received via SSE `permission.asked` event.
+ * Cached in StatusStream.permissionCache until the session becomes idle
+ * or the request is explicitly replied to via replyPermission().
+ */
+export interface PendingPermission {
+  /** Unique ID for this permission request; used when calling replyPermission(). */
+  id: string;
+  /** Tool name that needs authorization (e.g. "bash", "write"). */
+  permission: string;
+  /** Resource/command patterns that require authorization. */
+  patterns: string[];
+}
+
 export type SessionStatus =
   | { type: "idle" }
   | { type: "busy" }
@@ -164,6 +178,12 @@ class StatusStream {
   readonly statusCache = new Map<string, SessionStatus>();
 
   /**
+   * Pending permission requests per session, keyed by sessionID.
+   * Populated by `permission.asked` SSE events; cleared when session becomes idle.
+   */
+  readonly permissionCache = new Map<string, PendingPermission[]>();
+
+  /**
    * Pending waiters per session: each entry is a Set of { resolve, reject }
    * pairs waiting for that session to become idle.
    */
@@ -196,6 +216,47 @@ class StatusStream {
    */
   getStatus(sessionId: string): SessionStatus {
     return this.statusCache.get(sessionId) ?? { type: "idle" };
+  }
+
+  /**
+   * Return the list of pending permission requests for a session.
+   * Returns [] if the session has no pending requests.
+   */
+  getPendingPermissions(sessionId: string): PendingPermission[] {
+    return this.permissionCache.get(sessionId) ?? [];
+  }
+
+  /**
+   * Remove a single pending permission request by its requestId.
+   * Other requests for the same session are preserved.
+   */
+  removePendingPermission(sessionId: string, requestId: string): void {
+    const existing = this.permissionCache.get(sessionId);
+    if (!existing) return;
+    const updated = existing.filter((p) => p.id !== requestId);
+    if (updated.length === 0) {
+      this.permissionCache.delete(sessionId);
+    } else {
+      this.permissionCache.set(sessionId, updated);
+    }
+  }
+
+  /**
+   * Inject pending permissions directly into the cache.
+   * For testing only — allows unit tests to set up state without a live SSE stream.
+   * @internal
+   */
+  injectPermissionForTesting(sessionId: string, permissions: PendingPermission[]): void {
+    this.permissionCache.set(sessionId, permissions);
+  }
+
+  /**
+   * Expose applyEvent() for testing — processes a synthetic SSE event as if
+   * it were received from the live GET /event stream.
+   * @internal
+   */
+  applyEventForTesting(event: { type: string; properties?: Record<string, unknown> }): void {
+    this.applyEvent(event as SseEvent);
   }
 
   /**
@@ -373,6 +434,24 @@ class StatusStream {
     const props = (event.properties ?? event.data) as Record<string, unknown> | undefined;
     if (!props) return;
 
+    if (event.type === "permission.asked") {
+      const sessionId = props["sessionID"] as string | undefined;
+      const id = props["id"] as string | undefined;
+      const permission = props["permission"] as string | undefined;
+      const patterns = props["patterns"] as string[] | undefined;
+      if (!sessionId || !id || !permission) return;
+
+      const entry: PendingPermission = {
+        id,
+        permission,
+        patterns: Array.isArray(patterns) ? patterns : [],
+      };
+
+      const existing = this.permissionCache.get(sessionId) ?? [];
+      this.permissionCache.set(sessionId, [...existing, entry]);
+      return;
+    }
+
     if (event.type === "session.status") {
       const sessionId = props["sessionID"] as string | undefined;
       if (!sessionId) return;
@@ -383,8 +462,9 @@ class StatusStream {
       // Write to cache (mirrors setData("session_status", ...))
       this.statusCache.set(sessionId, status);
 
-      // Fire idle waiters
+      // Fire idle waiters and clear permission cache
       if (status.type === "idle") {
+        this.permissionCache.delete(sessionId);
         this.fireIdleWaiters(sessionId);
       }
       return;
@@ -395,6 +475,7 @@ class StatusStream {
       const sessionId = props["sessionID"] as string | undefined;
       if (!sessionId) return;
       this.statusCache.set(sessionId, { type: "idle" });
+      this.permissionCache.delete(sessionId);
       this.fireIdleWaiters(sessionId);
     }
   }
@@ -438,6 +519,87 @@ export class OpenCodeNode {
    */
   injectStatusForTesting(sessionId: string, status: SessionStatus): void {
     this.statusStream.statusCache.set(sessionId, status);
+  }
+
+  /**
+   * Inject pending permissions directly into the SSE cache.
+   * For testing only — allows unit tests to set up permission state without a live SSE stream.
+   * @internal
+   */
+  injectPermissionForTesting(sessionId: string, permissions: PendingPermission[]): void {
+    this.statusStream.injectPermissionForTesting(sessionId, permissions);
+  }
+
+  /**
+   * Apply a synthetic SSE event directly to the StatusStream, as if it were
+   * received from the live GET /event stream.
+   * For testing only — used to exercise the full applyEvent() logic without a
+   * live SSE connection.
+   * @internal
+   */
+  applyEventForTesting(event: { type: string; properties?: Record<string, unknown> }): void {
+    this.statusStream.applyEventForTesting(event);
+  }
+
+  // ── Permission management ────────────────────────────────────────────────────
+
+  /**
+   * Return the list of pending permission requests for a session.
+   * Delegates to the persistent StatusStream's permissionCache.
+   * Returns [] if the session has no pending requests.
+   */
+  getPendingPermissions(sessionId: string): PendingPermission[] {
+    return this.statusStream.getPendingPermissions(sessionId);
+  }
+
+  /**
+   * Remove a single pending permission request by its requestId.
+   * Delegates to the persistent StatusStream's permissionCache.
+   */
+  removePendingPermission(sessionId: string, requestId: string): void {
+    this.statusStream.removePendingPermission(sessionId, requestId);
+  }
+
+  /**
+   * Reply to a pending permission request on this node.
+   * Sends POST /api/session/:sessionId/permission/:requestId/reply.
+   *
+   * @param sessionId  The session that has a pending permission request.
+   * @param requestId  The permission request ID (from PendingPermission.id).
+   * @param reply      "once" to approve this single invocation, "reject" to deny.
+   * @param message    Optional message to send to the slave alongside the reply.
+   * @throws NodeError if the HTTP response is not 204.
+   *
+   * Note: uses raw `fetch` rather than `this.request()` because `request()` is
+   * designed for JSON-body responses and calls `res.text()` / `res.json()`.
+   * A 204 No Content response has no body, so `request<void>()` would work, but
+   * we want explicit 204-only success here: any other 2xx (e.g. 200 with a body)
+   * should still be treated as an error for this endpoint.
+   */
+  async replyPermission(
+    sessionId: string,
+    requestId: string,
+    reply: "once" | "reject",
+    message?: string
+  ): Promise<void> {
+    const path = `/api/session/${encodeURIComponent(sessionId)}/permission/${encodeURIComponent(requestId)}/reply`;
+    const body: Record<string, unknown> = { reply };
+    if (message) body["message"] = message;
+
+    const url = `${this.baseUrl}${path}`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: this.headers(),
+      body: JSON.stringify(body),
+    });
+
+    if (res.status !== 204) {
+      const text = await res.text().catch(() => "");
+      throw new NodeError(
+        `POST ${path} → HTTP ${res.status}: ${text}`,
+        res.status
+      );
+    }
   }
 
   // ── Private helpers ─────────────────────────────────────────────────────────
